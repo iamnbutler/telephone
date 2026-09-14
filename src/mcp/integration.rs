@@ -132,15 +132,24 @@ impl Server {
         );
     }
     fn reply(&mut self) -> Value {
+        self.reply_with_timeout(Duration::from_secs(2))
+    }
+    fn reply_with_timeout(&mut self, timeout: Duration) -> Value {
         let start = Instant::now();
+        let mut scanned = 0;
         loop {
-            if let Some(end) = self.received.iter().position(|&b| b == b'\n') {
+            // Scan each byte once, including when the socket temporarily has no
+            // data. Re-scanning an accumulating bulk reply is quadratic work.
+            if let Some(relative_end) = self.received[scanned..].iter().position(|&b| b == b'\n') {
+                let end = scanned + relative_end;
                 let bytes: Vec<_> = self.received.drain(..=end).collect();
                 return serde_json::from_slice(&bytes).unwrap();
             }
+            scanned = self.received.len();
             assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "MCP response was not responsive"
+                start.elapsed() < timeout,
+                "MCP response exceeded {timeout:?}; buffered {} bytes",
+                self.received.len()
             );
             let mut buffer = [0; 64 * 1024];
             match self.socket().read(&mut buffer) {
@@ -149,6 +158,7 @@ impl Server {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(2))
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("MCP output failed: {e}"),
             }
         }
@@ -305,9 +315,41 @@ fn cancellation_during_partial_output_preserves_framing_but_not_the_receipt() {
     }
     server.cancel(1);
     server.ping(2);
-    assert_eq!(server.reply()["id"], 1);
+    // This is a bulk drain, not a control-latency assertion. The production
+    // server still enforces its unchanged five-second output deadline. Allow
+    // the debug-build client to drain the large frame or observe that failure.
+    assert_eq!(server.reply_with_timeout(Duration::from_secs(6))["id"], 1);
     assert_eq!(server.reply()["id"], 2);
     assert_eq!(server.unread(), 10);
+    server.socket().shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server.finish(), "ok");
+}
+
+#[test]
+fn buffered_socket_replies_preserve_the_following_frame() {
+    let mut server = Server::start();
+    server.ping(1);
+    server.ping(2);
+    // Read both real server replies into the buffer before parsing either one.
+    // This makes the coalesced-frame case deterministic without a reader mock.
+    let start = Instant::now();
+    while server.received.iter().filter(|&&b| b == b'\n').count() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let mut bytes = [0; 1024];
+        match server.socket().read(&mut bytes) {
+            Ok(0) => panic!("server closed before both ping replies"),
+            Ok(n) => server.received.extend_from_slice(&bytes[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("reading ping replies failed: {e}"),
+        }
+    }
+    assert_eq!(server.reply()["id"], 1);
+    assert!(!server.received.is_empty());
+    assert_eq!(server.reply()["id"], 2);
+    assert!(server.received.is_empty());
     server.socket().shutdown(Shutdown::Write).unwrap();
     assert_eq!(server.finish(), "ok");
 }

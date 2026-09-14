@@ -65,6 +65,23 @@ jobs:
           test -f "releases/$version.md"
       - name: Test
         run: cargo test --locked --all-targets --target "$TARGET"
+      - name: Stress MCP bulk-response test
+        if: runner.os == 'macOS'
+        run: |
+          # Independent real servers and SQLite stores compete for runner time.
+          pids=()
+          for attempt in {1..4}; do
+            printf 'Starting bulk-response stress run %s\n' "$attempt"
+            cargo test --locked --bin telephone --target "$TARGET" \
+              mcp::integration::cancellation_during_partial_output_preserves_framing_but_not_the_receipt \
+              -- --exact &
+            pids+=("$!")
+          done
+          failed=0
+          for pid in "${pids[@]}"; do
+            if ! wait "$pid"; then failed=1; fi
+          done
+          exit "$failed"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
