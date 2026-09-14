@@ -170,3 +170,46 @@ pub fn now_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env() -> Envelope {
+        Envelope::new("a:1".into(), "b:2".into(), Kind::Inform, "hi".into())
+    }
+
+    #[test]
+    fn a_new_message_starts_its_own_conversation() {
+        let e = env();
+        assert_eq!(e.id, e.conversation);
+        assert!(e.hop_chain.is_empty());
+    }
+
+    #[test]
+    fn hops_accumulate_in_order() {
+        let mut e = env();
+        e.add_hop("a:1").unwrap();
+        e.add_hop("b:2").unwrap();
+        assert_eq!(e.hop_chain, vec!["a:1", "b:2"]);
+    }
+
+    #[test]
+    fn the_loop_guard_trips_rather_than_dropping_silently() {
+        let mut e = env();
+        for i in 0..MAX_HOPS {
+            e.add_hop(&format!("r:{i}")).expect("under the limit");
+        }
+        let err = e.add_hop("r:last").expect_err("should refuse past the limit");
+        // The path matters more than the count when diagnosing a loop.
+        assert!(err.to_string().contains("r:0 -> r:1"));
+    }
+
+    #[test]
+    fn kinds_survive_a_round_trip_through_their_wire_names() {
+        for k in [Kind::Inform, Kind::Request, Kind::Reply, Kind::Event] {
+            assert_eq!(Kind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(Kind::parse("nonsense"), None);
+    }
+}

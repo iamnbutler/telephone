@@ -147,3 +147,46 @@ impl Registry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(addr: &str, name: &str) -> Agent {
+        Agent {
+            addr: addr.into(),
+            runtime: "claude",
+            name: name.into(),
+            cwd: None,
+            status: Status::Idle,
+            last_seen: 0,
+            transports: vec![Transport::Inbox],
+        }
+    }
+
+    #[test]
+    fn an_agent_answers_to_its_address_name_and_bare_id() {
+        let a = agent("claude:83487", "luau-4c");
+        assert!(a.matches("claude:83487"));
+        assert!(a.matches("luau-4c"));
+        assert!(a.matches("83487"));
+        assert!(!a.matches("claude:99999"));
+        assert!(!a.matches("other-name"));
+    }
+
+    #[test]
+    fn ambiguous_names_are_an_error_rather_than_a_guess() {
+        // Sending to the wrong agent is worse than refusing to send.
+        let registry = Registry::new(vec![]);
+        let agents = vec![agent("claude:1", "dup"), agent("codex:2", "dup")];
+        let err = registry.resolve(&agents, "dup").expect_err("should refuse");
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn resolving_an_unknown_name_points_at_list() {
+        let registry = Registry::new(vec![]);
+        let err = registry.resolve(&[], "nobody").expect_err("should fail");
+        assert!(err.to_string().contains("telephone list"));
+    }
+}
