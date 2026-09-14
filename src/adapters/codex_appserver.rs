@@ -18,11 +18,37 @@
 //! The wire format is newline-delimited JSON with no `jsonrpc` field --
 //! `{"id":N,"method":...,"params":...}` -- which is close enough to JSON-RPC
 //! to be mistaken for it and different enough to fail silently if you assume.
+//!
+//! ## Why desktop-owned threads stay inferred
+//!
+//! Threads created in the ChatGPT desktop app are owned by an app-server the
+//! app spawns as a child and talks to over stdio pipes, so there is no socket
+//! for us to ask. The app's own `~/.codex/ipc/ipc.sock` is a different thing
+//! entirely, and it was investigated and ruled out:
+//!
+//! - It is not newline-delimited JSON. Frames are a little-endian `u32` byte
+//!   count followed by JSON, and the reader destroys any connection whose
+//!   length is 0 or over 256MiB. A JSONL request opening with `{"id` is read
+//!   as a length of 1,684,611,707, which is why a naive handshake gets an
+//!   instant EOF rather than an error.
+//! - More decisively, the router exposes no bridge to app-server thread
+//!   status. Its `thread-owner-discovery` answers which *client* owns a
+//!   conversation, not whether a thread is idle or active, so even a correct
+//!   handshake would not yield the signal this module needs.
+//! - Connecting is not free of side effects: registration broadcasts a
+//!   client-status change to every other connected client.
+//!
+//! It is also a private, undocumented interface with no stability contract --
+//! the published app-server documentation describes the WebSocket control
+//! socket, not this router. So desktop-owned threads correctly remain
+//! `Liveness::Inferred`.
 
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Spawning an app-server costs a process and some config loading, so give it
@@ -94,17 +120,32 @@ pub fn thread_statuses(cli: &std::path::Path) -> HashMap<String, ThreadStatus> {
     query(cli).unwrap_or_default()
 }
 
+/// Kills the app-server on every exit path.
+///
+/// The server runs until its stdin closes, so an early return that merely
+/// drops the handle leaves a process behind. A guard is used rather than a
+/// tidy-up at the bottom of the function because several steps can fail.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn query(cli: &std::path::Path) -> Option<HashMap<String, ThreadStatus>> {
-    let mut child = Command::new(cli)
+    let child = Command::new(cli)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut guard = ChildGuard(child);
 
     {
-        let stdin = child.stdin.as_mut()?;
+        let stdin = guard.0.stdin.as_mut()?;
         // Note the absent `jsonrpc` field: the schema defines requests as
         // exactly {id, method, params}, and the server ignores anything else.
         let init = serde_json::json!({
@@ -122,22 +163,41 @@ fn query(cli: &std::path::Path) -> Option<HashMap<String, ThreadStatus>> {
         stdin.flush().ok()?;
     }
 
-    let stdout = child.stdout.take()?;
-    let deadline = Instant::now() + QUERY_TIMEOUT;
-    let mut reader = BufReader::new(stdout);
-    let mut out = HashMap::new();
-    let mut line = String::new();
+    let stdout = guard.0.stdout.take()?;
 
+    // `read_line` blocks with no timeout of its own, so reading on this thread
+    // would let a server that never emits a newline hang every `telephone`
+    // command indefinitely. Read on a worker instead and bound the wait here.
+    //
+    // The worker is deliberately detached: when this function returns, the
+    // guard kills the child, the pipe closes, the pending read returns 0 and
+    // the worker exits on its own.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // A closed receiver means the caller already gave up.
+            if tx.send(line.clone()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + QUERY_TIMEOUT;
+    let mut out = HashMap::new();
     loop {
-        if Instant::now() > deadline {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            crate::debug(|| "codex: app-server query timed out".to_string());
             break;
-        }
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        };
+        let Ok(line) = rx.recv_timeout(remaining) else { break };
+
         let Ok(response) = serde_json::from_str::<Response>(line.trim()) else { continue };
         if response.id != Some(2) {
             continue;
@@ -152,9 +212,6 @@ fn query(cli: &std::path::Path) -> Option<HashMap<String, ThreadStatus>> {
         break;
     }
 
-    // The app-server runs until its stdin closes; don't leave it behind.
-    let _ = child.kill();
-    let _ = child.wait();
     Some(out)
 }
 
