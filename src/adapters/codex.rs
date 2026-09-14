@@ -20,10 +20,47 @@
 //! `codex queue` is a real push channel, so Codex is not the pull-only case it
 //! first appears to be. The difference from Claude Code's socket is latency and
 //! confirmation: we learn the message was queued, not that it was seen.
+//!
+//! ## Why liveness here is inferred, not confirmed
+//!
+//! Discovery reports Codex threads as [`Liveness::Inferred`] -- `recent?` in
+//! `telephone list` -- and that is a deliberate stop, not a gap waiting to be
+//! filled. Recency cannot distinguish a running thread from one that exited a
+//! second after its last write, and the alternatives were investigated and
+//! ruled out:
+//!
+//! **The app-server protocol has the right answer but not for us.**
+//! `thread/list` returns a runtime status of `notLoaded`, `idle`, `active` or
+//! `systemError`. But that status is only known to the daemon that actually
+//! loaded and ran the thread. Spawning an app-server to ask is useless: a
+//! fresh instance owns nothing and returns `notLoaded` for every thread on the
+//! machine. A *managed* daemon (`codex app-server daemon start`) can answer,
+//! but only for threads it runs itself, which means it must already have been
+//! running when the session started. Started on demand it owns nothing, so
+//! there is no version of on-demand that works.
+//!
+//! Reaching that daemon, should anyone need to: its control socket speaks
+//! WebSocket over a Unix socket, not raw JSON. A correct upgrade handshake
+//! returns `101 Switching Protocols`, after which the app-server protocol runs
+//! inside text frames. Plain JSON writes are silently ignored, which makes a
+//! naive attempt look like a hang rather than an error.
+//!
+//! **The ChatGPT desktop app owns its threads and does not expose them.** Its
+//! app-server runs as a child of the app, spoken to over stdio pipes, so there
+//! is no socket to query. The app's own `~/.codex/ipc/ipc.sock` is a separate
+//! private router and was ruled out on three grounds: frames are a
+//! little-endian `u32` byte count followed by JSON rather than newline-
+//! delimited (a request opening `{"id` reads as a length of 1,684,611,707,
+//! which is why a naive handshake gets an instant EOF); the router answers
+//! thread *ownership*, not thread status, so even a correct handshake would
+//! not yield the signal; and connecting broadcasts a client-status change to
+//! every other connected client, so it is not an invisible read.
+//!
+//! The honest summary: for desktop-owned threads this is not currently
+//! knowable from outside, and `notLoaded` means "cannot tell", never "dead".
 
 use crate::envelope::Envelope;
 use crate::inbox;
-use crate::adapters::codex_appserver::{self, ThreadStatus};
 use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -205,9 +242,9 @@ fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Ag
         runtime: RUNTIME,
         name,
         cwd: cwd.map(PathBuf::from),
-        // Recency alone can't distinguish a running thread from one that
-        // exited just after its last write. `enrich_with_runtime_status`
-        // upgrades this when the owning daemon can be reached.
+        // Recency cannot distinguish a running thread from one that exited
+        // just after its last write, so status stays unknown and liveness
+        // stays inferred. See the note on liveness at the top of this module.
         status: Status::Unknown,
         liveness: Liveness::Inferred,
         last_seen,
@@ -263,16 +300,14 @@ impl Adapter for Codex {
 
         // The state database is authoritative for *which* threads exist;
         // rollouts are the safety net.
-        let mut agents = match self.discover_via_sqlite(cutoff) {
-            Ok(agents) if !agents.is_empty() => agents,
-            Ok(_) => self.discover_via_rollouts(cutoff)?,
+        match self.discover_via_sqlite(cutoff) {
+            Ok(agents) if !agents.is_empty() => Ok(agents),
+            Ok(_) => self.discover_via_rollouts(cutoff),
             Err(e) => {
                 crate::debug(|| format!("codex: state db unreadable ({e}); using rollouts"));
-                self.discover_via_rollouts(cutoff)?
+                self.discover_via_rollouts(cutoff)
             }
-        };
-        enrich_with_runtime_status(&mut agents);
-        Ok(agents)
+        }
     }
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
@@ -341,60 +376,3 @@ fn queue_message(cli: &PathBuf, thread: &str, env: &Envelope) -> Result<()> {
     Ok(())
 }
 
-/// Replaces inferred liveness with real runtime status where a daemon can
-/// tell us, leaving the rest untouched.
-///
-/// Only worth the process spawn when there's a chance of a conclusive answer,
-/// so this is skipped entirely unless a managed app-server daemon is running.
-/// Without one, every thread comes back `notLoaded` and we'd have paid for
-/// nothing.
-fn enrich_with_runtime_status(agents: &mut [Agent]) {
-    if agents.is_empty() {
-        return;
-    }
-    if !managed_daemon_running() {
-        crate::debug(|| {
-            "codex: no managed app-server daemon; liveness stays inferred".to_string()
-        });
-        return;
-    }
-    let Some(cli) = codex_cli() else {
-        crate::debug(|| "codex: CLI not found; liveness stays inferred".to_string());
-        return;
-    };
-
-    let statuses = codex_appserver::thread_statuses(&cli);
-    crate::debug(|| format!("codex: app-server reported {} thread status(es)", statuses.len()));
-    if statuses.is_empty() {
-        return;
-    }
-    for agent in agents.iter_mut() {
-        let Some(id) = agent.addr.split_once(':').map(|(_, id)| id) else { continue };
-        let Some(status) = statuses.get(id) else { continue };
-        if !status.is_conclusive() {
-            continue;
-        }
-        agent.status = match status {
-            ThreadStatus::Active => Status::Busy,
-            _ => Status::Idle,
-        };
-        agent.liveness = Liveness::Verified;
-    }
-}
-
-/// Whether a managed app-server daemon is running.
-///
-/// Its control socket is the cheap signal; checking for the file costs nothing
-/// next to spawning an app-server to ask.
-fn managed_daemon_running() -> bool {
-    let home = match std::env::var("CODEX_HOME") {
-        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
-        _ => match dirs::home_dir() {
-            Some(h) => h.join(".codex"),
-            None => return false,
-        },
-    };
-    home.join("app-server-control")
-        .join("app-server-control.sock")
-        .exists()
-}

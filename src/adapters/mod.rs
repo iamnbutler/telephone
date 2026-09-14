@@ -1,6 +1,5 @@
 pub mod claude_code;
 pub mod codex;
-pub mod codex_appserver;
 
 use crate::envelope::{Envelope, Kind, Trust};
 

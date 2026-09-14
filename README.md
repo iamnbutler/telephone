@@ -50,13 +50,17 @@ and telephone checks both that the pid exists and that the process holding it
 started when the session says it did. Without that second check a recycled pid
 would accept a message meant for a session that exited hours ago.
 
-Codex threads are usually `recent?`. Its on-disk records answer "when was this
-last written to", not "is this running now" -- a thread that exited a second
-after its last write is indistinguishable from one mid-turn. The app-server
-protocol does answer the real question, via a `thread/list` runtime status, but
-only the daemon that owns a thread knows it: any other process sees
-`notLoaded`. So telephone asks when a managed daemon is reachable and marks the
-result `live`, and otherwise falls back to recency and says so.
+Codex threads are `recent?`. Its on-disk records answer "when was this last
+written to", not "is this running now" -- a thread that exited a second after
+its last write is indistinguishable from one mid-turn. The app-server protocol
+does answer the real question, but only the daemon that actually ran a thread
+knows its status, and threads created in the ChatGPT desktop app are owned by a
+daemon that exposes no way to ask. Starting a daemon on demand doesn't help: a
+fresh one owns nothing and reports every thread as `notLoaded`, which means
+"cannot tell", never "dead".
+
+So telephone reports recency and says that's what it is. The investigation
+behind that stop is written up at the top of `src/adapters/codex.rs`.
 
 `telephone doctor` reports which agents are confirmed and why.
 
