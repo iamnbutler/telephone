@@ -47,6 +47,10 @@ struct SessionRecord {
     status_updated_at: Option<u64>,
     #[serde(rename = "startedAt")]
     started_at: Option<u64>,
+    /// Process start time, used to tell this session apart from a later
+    /// process that happens to inherit its pid.
+    #[serde(rename = "procStart")]
+    proc_start: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +128,9 @@ impl Adapter for ClaudeCode {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
-        let mut agents = Vec::new();
+        // Read every record first, then resolve liveness for the whole set in
+        // one `ps` call rather than spawning a process per session.
+        let mut records = Vec::new();
         for entry in fs::read_dir(&self.sessions_dir)?.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -132,10 +138,29 @@ impl Adapter for ClaudeCode {
             }
             let Ok(raw) = fs::read_to_string(&path) else { continue };
             let Ok(rec) = serde_json::from_str::<SessionRecord>(&raw) else { continue };
+            if crate::proc::is_alive(rec.pid) {
+                records.push(rec);
+            }
+        }
 
-            // A registry entry outlives the process it describes. Checking
-            // liveness here keeps dead sessions out of `list`.
-            if !crate::proc::is_alive(rec.pid) {
+        let pids: Vec<u32> = records.iter().map(|r| r.pid).collect();
+        let started = crate::proc::start_times(&pids);
+
+        let mut agents = Vec::new();
+        for rec in records {
+            // A registry entry outlives the process it describes, and pids get
+            // recycled. Without this check a message meant for a session that
+            // exited hours ago would be delivered to whatever now holds its pid.
+            if !crate::proc::start_time_matches(rec.started_at, started.get(&rec.pid)) {
+                crate::debug(|| {
+                    format!(
+                        "claude: skipping pid {} -- session recorded start {:?}, \
+                         but the process holding that pid started {:?}",
+                        rec.pid,
+                        rec.started_at,
+                        started.get(&rec.pid)
+                    )
+                });
                 continue;
             }
 
