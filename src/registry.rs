@@ -55,7 +55,7 @@ impl Liveness {
 }
 
 /// How to actually reach an agent, most faithful first.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Transport {
     /// Claude Code's native per-session Unix socket. Delivers into the live
     /// session as a real turn.
@@ -70,6 +70,23 @@ pub enum Transport {
     /// The universal fallback: a filesystem inbox the agent drains itself,
     /// via the telephone MCP server or a shell hook.
     Inbox,
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClaudeUds {
+                socket, session_id, ..
+            } => f
+                .debug_struct("ClaudeUds")
+                .field("socket", socket)
+                .field("session_id", session_id)
+                .field("token", &"[redacted]")
+                .finish(),
+            Self::CodexQueue => f.write_str("CodexQueue"),
+            Self::Inbox => f.write_str("Inbox"),
+        }
+    }
 }
 
 impl Transport {
@@ -117,8 +134,10 @@ impl Agent {
 /// What happened when we tried to deliver.
 #[derive(Debug)]
 pub enum Delivered {
-    /// Went into the live session over its own protocol.
-    Native { via: &'static str },
+    /// Bytes were written, but the runtime has not confirmed acceptance.
+    Unconfirmed { via: &'static str },
+    /// The runtime's queue command accepted the message, not necessarily read it.
+    Accepted { via: &'static str },
     /// Left in an inbox. `note` explains how the agent will see it, because
     /// "queued" without that is indistinguishable from "lost".
     Queued { path: PathBuf, note: String },
@@ -131,6 +150,10 @@ pub trait Adapter {
     /// Enumerate live sessions. Should return `Ok(vec![])` rather than erroring
     /// when the runtime simply isn't installed.
     fn discover(&self) -> Result<Vec<Agent>>;
+
+    fn discover_all(&self) -> Result<Vec<Agent>> {
+        self.discover()
+    }
 
     /// Deliver `env` to `agent`, which this adapter produced.
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered>;
@@ -149,10 +172,18 @@ impl Registry {
     /// Discovery is best-effort per adapter: one broken runtime shouldn't
     /// hide every other agent on the box.
     pub fn discover(&self) -> (Vec<Agent>, Vec<String>) {
+        self.discover_with(false)
+    }
+
+    pub fn discover_with(&self, all: bool) -> (Vec<Agent>, Vec<String>) {
         let mut agents = Vec::new();
         let mut warnings = Vec::new();
         for adapter in &self.adapters {
-            match adapter.discover() {
+            match if all {
+                adapter.discover_all()
+            } else {
+                adapter.discover()
+            } {
                 Ok(found) => agents.extend(found),
                 Err(e) => warnings.push(format!("{}: {e}", adapter.runtime())),
             }
@@ -171,6 +202,23 @@ impl Registry {
 
     /// Resolve a user-typed name or address to exactly one agent.
     pub fn resolve(&self, agents: &[Agent], q: &str) -> Result<Agent> {
+        if q.contains(':') {
+            let address: crate::address::Address = q.parse()?;
+            if let Some(agent) = agents.iter().find(|a| a.addr == address.as_str()) {
+                return Ok(agent.clone());
+            }
+            let runtime = q.split_once(':').map(|(r, _)| r).unwrap_or("");
+            let adapter = self
+                .adapters
+                .iter()
+                .find(|a| a.runtime() == runtime)
+                .ok_or_else(|| anyhow::anyhow!("unsupported address runtime"))?;
+            return adapter
+                .discover_all()?
+                .into_iter()
+                .find(|a| a.addr == q)
+                .ok_or_else(|| anyhow::anyhow!("no agent matches this exact address"));
+        }
         let hits: Vec<&Agent> = agents.iter().filter(|a| a.matches(q)).collect();
         match hits.len() {
             0 => anyhow::bail!("no agent matches '{q}' (try `telephone list`)"),

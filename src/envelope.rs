@@ -1,170 +1,141 @@
-//! The canonical message format every adapter translates to and from.
-//!
-//! The envelope is deliberately small. Anything a specific runtime needs that
-//! doesn't fit here belongs in that runtime's adapter, not in the wire format.
-
+//! Bounded, validated messages. Transport metadata cannot confer authority.
+use crate::address::Address;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
-/// How many times a message may be relayed before we assume it's a loop.
-///
-/// Two agents that each reply to messages will ping-pong forever. Claude Code
-/// carries a `hop-chain` for the same reason; we carry the full chain rather
-/// than a bare counter so the path is visible when something does go wrong.
 pub const MAX_HOPS: usize = 8;
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_ENVELOPE_BYTES: usize = 512 * 1024;
 
-/// What the sender wants the receiver to do about this message.
-///
-/// This is the FIPA-ACL "performative" idea, trimmed to the four that earn
-/// their keep. The distinction matters because it's the difference between
-/// "here's a fact, do what you like with it" and "do this and report back".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// A statement. No response expected.
+    #[default]
     Inform,
-    /// A task or question. A reply is expected.
     Request,
-    /// Answers an earlier `Request`; `reply_to` names it.
     Reply,
-    /// Something happened (a build finished, a session went idle).
     Event,
 }
-
 impl Kind {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "inform" => Some(Kind::Inform),
-            "request" => Some(Kind::Request),
-            "reply" => Some(Kind::Reply),
-            "event" => Some(Kind::Event),
+            "inform" => Some(Self::Inform),
+            "request" => Some(Self::Request),
+            "reply" => Some(Self::Reply),
+            "event" => Some(Self::Event),
             _ => None,
         }
     }
-
     pub fn as_str(&self) -> &'static str {
         match self {
-            Kind::Inform => "inform",
-            Kind::Request => "request",
-            Kind::Reply => "reply",
-            Kind::Event => "event",
+            Self::Inform => "inform",
+            Self::Request => "request",
+            Self::Reply => "reply",
+            Self::Event => "event",
         }
     }
 }
 
-/// How much the receiver should trust the body.
-///
-/// This exists because a peer message is untrusted text entering a loop that
-/// holds a shell and a filesystem. The receiving adapter is responsible for
-/// rendering anything below `Peer` inside a clearly-fenced untrusted block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Trust {
-    /// Same uid, same machine, proved it could read our key material.
-    Peer,
-    /// Everything else.
+    #[default]
+    // Legacy "peer" is read as untrusted, never as a distinct authority level.
+    #[serde(alias = "peer")]
     Untrusted,
 }
 
-/// When delivery is acceptable to the receiver.
-///
-/// An agent is not a server: it is a turn-based loop that is often busy for
-/// minutes. "Send a message" has to answer what happens when the target is
-/// mid-turn, and the honest answer differs per message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Delivery {
-    /// Leave it in the inbox; the agent picks it up on its own schedule.
-    Queue,
-    /// Ask the runtime to surface it as soon as the current turn ends.
-    WhenIdle,
-    /// Interrupt the current turn. Runtimes that can't will fall back to
-    /// `WhenIdle` and say so.
-    Interrupt,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Envelope {
-    pub id: String,
-    /// Threads messages together. A fresh `Request` starts a new conversation;
-    /// replies inherit it.
-    pub conversation: String,
-    /// The `id` of the message this answers, if any.
+    pub id: Uuid,
+    pub conversation: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<String>,
-
-    /// Canonical address of the sender, e.g. `claude:83487`.
-    pub from: String,
-    /// Human-facing name, for display only. Never route on this.
+    pub reply_to: Option<Uuid>,
+    pub from: Address,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_name: Option<String>,
-    pub to: String,
-
+    pub to: Address,
     pub kind: Kind,
     pub body: String,
-
+    // Older versions wrote null here. Non-null delivery controls are unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<()>,
     #[serde(default)]
-    pub delivery: Option<Delivery>,
     pub trust: Trust,
-    /// Every address this message has passed through, oldest first.
     #[serde(default)]
-    pub hop_chain: Vec<String>,
+    pub hop_chain: Vec<Address>,
     pub sent_at: u64,
 }
 
 impl Envelope {
-    pub fn new(from: String, to: String, kind: Kind, body: String) -> Self {
-        let id = new_id();
-        Envelope {
-            conversation: id.clone(),
+    /// Creates a draft. The store attaches journal ancestry before delivery.
+    pub fn new(from: &str, to: &str, kind: Kind, body: String) -> Result<Self> {
+        if body.is_empty() || body.len() > MAX_BODY_BYTES {
+            bail!("message body must contain 1..={MAX_BODY_BYTES} bytes");
+        }
+        let id = Uuid::new_v4();
+        Ok(Self {
             id,
+            conversation: id,
             reply_to: None,
-            from,
+            from: from.parse()?,
+            to: to.parse()?,
             from_name: None,
-            to,
             kind,
             body,
             delivery: None,
-            trust: Trust::Peer,
+            trust: Trust::Untrusted,
             hop_chain: Vec::new(),
             sent_at: now_millis(),
-        }
+        })
     }
-
-    /// Records that this message passed through `addr`.
-    ///
-    /// Returns an error rather than silently dropping, so a relay loop shows up
-    /// as a visible failure instead of messages quietly vanishing.
-    pub fn add_hop(&mut self, addr: &str) -> anyhow::Result<()> {
-        if self.hop_chain.len() >= MAX_HOPS {
-            anyhow::bail!(
-                "hop limit ({}) exceeded, likely a relay loop: {}",
-                MAX_HOPS,
-                self.hop_chain.join(" -> ")
-            );
+    pub fn validate(&self) -> Result<()> {
+        if self.body.is_empty() || self.body.len() > MAX_BODY_BYTES {
+            bail!("invalid message body length");
         }
-        self.hop_chain.push(addr.to_string());
+        if self.from == self.to {
+            bail!("refusing a message addressed to its sender");
+        }
+        if self.id.is_nil()
+            || self.conversation.is_nil()
+            || self.reply_to.is_some_and(|id| id.is_nil())
+        {
+            bail!("nil message identifiers are not allowed");
+        }
+        if self
+            .from_name
+            .as_ref()
+            .is_some_and(|s| s.len() > 256 || s.chars().any(char::is_control))
+        {
+            bail!("sender name must be at most 256 bytes without control characters");
+        }
+        if self.kind == Kind::Reply && self.reply_to.is_none() {
+            bail!("a reply requires reply_to");
+        }
+        if self.hop_chain.is_empty()
+            || self.hop_chain.len() > MAX_HOPS
+            || self.hop_chain.last() != Some(&self.from)
+        {
+            bail!("invalid hop chain");
+        }
         Ok(())
     }
-
-    /// Renders the message for a human (or an agent) reading their inbox.
-    pub fn render(&self) -> String {
-        let who = self.from_name.as_deref().unwrap_or(&self.from);
-        let mut out = format!("[{}] from {} ({})", self.kind.as_str(), who, self.from);
-        if let Some(rt) = &self.reply_to {
-            out.push_str(&format!(" re: {rt}"));
+    pub fn add_hop(&mut self, address: Address) -> Result<()> {
+        if self.hop_chain.len() >= MAX_HOPS {
+            bail!("hop limit ({MAX_HOPS}) exceeded; start a new conversation only with user direction");
         }
-        out.push('\n');
-        out.push_str(&self.body);
-        out
+        self.hop_chain.push(address);
+        Ok(())
     }
 }
-
 pub fn new_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    Uuid::new_v4().to_string()
 }
-
 pub fn now_millis() -> u64 {
+    // A pre-epoch clock is treated as zero, never used as identity proof.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -174,42 +145,18 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn env() -> Envelope {
-        Envelope::new("a:1".into(), "b:2".into(), Kind::Inform, "hi".into())
-    }
-
     #[test]
-    fn a_new_message_starts_its_own_conversation() {
-        let e = env();
-        assert_eq!(e.id, e.conversation);
-        assert!(e.hop_chain.is_empty());
-    }
-
-    #[test]
-    fn hops_accumulate_in_order() {
-        let mut e = env();
-        e.add_hop("a:1").unwrap();
-        e.add_hop("b:2").unwrap();
-        assert_eq!(e.hop_chain, vec!["a:1", "b:2"]);
-    }
-
-    #[test]
-    fn the_loop_guard_trips_rather_than_dropping_silently() {
-        let mut e = env();
-        for i in 0..MAX_HOPS {
-            e.add_hop(&format!("r:{i}")).expect("under the limit");
-        }
-        let err = e.add_hop("r:last").expect_err("should refuse past the limit");
-        // The path matters more than the count when diagnosing a loop.
-        assert!(err.to_string().contains("r:0 -> r:1"));
-    }
-
-    #[test]
-    fn kinds_survive_a_round_trip_through_their_wire_names() {
-        for k in [Kind::Inform, Kind::Request, Kind::Reply, Kind::Event] {
-            assert_eq!(Kind::parse(k.as_str()), Some(k));
-        }
-        assert_eq!(Kind::parse("nonsense"), None);
+    fn validates_limits_and_requires_reply_ancestry() {
+        assert!(Envelope::new("a:1", "b:2", Kind::Inform, "x".repeat(MAX_BODY_BYTES + 1)).is_err());
+        let mut e = Envelope::new("a:1", "b:2", Kind::Reply, "hello".into()).unwrap();
+        e.add_hop(e.from.clone()).unwrap();
+        assert!(e.validate().is_err());
+        e.reply_to = Some(Uuid::new_v4());
+        assert!(e.validate().is_ok());
+        assert_eq!(e.trust, Trust::Untrusted);
+        assert_eq!(
+            serde_json::from_str::<Trust>("\"peer\"").unwrap(),
+            Trust::Untrusted
+        );
     }
 }

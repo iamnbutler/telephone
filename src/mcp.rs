@@ -1,194 +1,307 @@
-//! The universal adapter: telephone as an MCP server over stdio.
-//!
-//! This is the piece that makes telephone work for runtimes with no peer
-//! protocol of their own. Nearly every serious agent speaks MCP, so an MCP
-//! server is a de facto universal channel: outbound works natively and
-//! immediately, and inbound works by the agent pulling its inbox.
-//!
-//! The catch, stated plainly: MCP is pull-only. An agent sees its messages
-//! when it decides to call `check_inbox`, not when they arrive. That is fine
-//! for coordination and useless for interrupts, which is why runtimes with a
-//! real push channel (Claude Code) get a native adapter instead.
-
-use crate::envelope::{Envelope, Kind};
-use crate::{identity, send};
-use anyhow::Result;
+//! Bounded JSON-RPC over stdio. Operational errors remain visible tool results.
+use crate::{envelope::Kind, identity, send, store::InboxBatch};
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_REQUEST: u64 = 1024 * 1024;
+struct Reply {
+    value: Value,
+    receipt: Option<InboxBatch>,
+}
+impl Reply {
+    fn value(value: Value) -> Self {
+        Self {
+            value,
+            receipt: None,
+        }
+    }
+}
+struct RpcError {
+    code: i32,
+    message: String,
+}
+impl RpcError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+        }
+    }
+}
+fn args<T: serde::de::DeserializeOwned>(value: Value) -> std::result::Result<T, RpcError> {
+    serde_json::from_value(value).map_err(|e| RpcError::invalid(e.to_string()))
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {
+    _meta: Option<serde_json::Map<String, Value>>,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListArgs {
+    #[serde(default)]
+    all: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendArgs {
+    to: String,
+    body: String,
+    #[serde(default)]
+    kind: Kind,
+    reply_to: Option<uuid::Uuid>,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxArgs {
+    #[serde(default)]
+    peek: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCall {
+    name: String,
+    #[serde(default = "empty_object")]
+    arguments: Value,
+    _meta: Option<serde_json::Map<String, Value>>,
+}
+fn empty_object() -> Value {
+    json!({})
+}
 
 pub fn serve() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
+    serve_io(std::io::stdin().lock(), std::io::stdout().lock())
+}
+fn serve_io(mut input: impl BufRead, mut output: impl Write) -> Result<()> {
+    let mut initialized = false;
+    let mut ready = false;
+    loop {
+        let mut line = String::new();
+        let size = input
+            .by_ref()
+            .take(MAX_REQUEST + 1)
+            .read_line(&mut line)
+            .context("reading MCP request")?;
+        if size == 0 {
+            return Ok(());
+        }
+        if size as u64 > MAX_REQUEST {
+            writeln!(
+                output,
+                "{}",
+                error(Value::Null, -32600, "request exceeds size limit")
+            )?;
+            output.flush()?;
+            anyhow::bail!("closing MCP stream after oversized request");
+        }
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
-
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = req.get("id").cloned();
-
-        // Notifications have no id and take no response.
-        if id.is_none() {
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                writeln!(output, "{}", error(Value::Null, -32700, "invalid JSON"))?;
+                output.flush()?;
+                continue;
+            }
+        };
+        let id = request.get("id").cloned();
+        let method = request.get("method").and_then(Value::as_str);
+        if !request.is_object()
+            || request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || method.is_none()
+            || id
+                .as_ref()
+                .is_some_and(|v| !(v.is_string() || v.is_number()))
+        {
+            writeln!(
+                output,
+                "{}",
+                error(Value::Null, -32600, "invalid JSON-RPC request")
+            )?;
+            output.flush()?;
             continue;
         }
-
-        let result = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "telephone", "version": env!("CARGO_PKG_VERSION") }
-            })),
-            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => call_tool(&req),
-            _ => Err(anyhow::anyhow!("unknown method: {method}")),
-        };
-
-        let response = match result {
-            Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
-            Err(e) => json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": { "code": -32000, "message": e.to_string() }
-            }),
-        };
-        writeln!(stdout, "{response}")?;
-        stdout.flush()?;
-    }
-    Ok(())
-}
-
-fn tool_definitions() -> Value {
-    json!([
-        {
-            "name": "list_agents",
-            "description": "List other coding agents currently running on this \
-                machine that can be messaged, across runtimes (Claude Code, Codex, \
-                and any agent registered with telephone).",
-            "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "send_message",
-            "description": "Send a message to another agent. Use list_agents first \
-                to find a valid address. Messages are delivered natively when the \
-                target runtime supports it, otherwise queued in the target's inbox.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "to": { "type": "string", "description": "Agent address or name, e.g. 'claude:83487' or 'nexthub-87'" },
-                    "body": { "type": "string", "description": "The message text" },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["inform", "request", "reply", "event"],
-                        "description": "'request' expects a reply; 'inform' and 'event' do not"
-                    },
-                    "reply_to": { "type": "string", "description": "Message id this answers, if any" }
-                },
-                "required": ["to", "body"]
+        let method = method.context("validated method disappeared")?;
+        if id.is_none() {
+            if method == "notifications/initialized" && initialized {
+                ready = true;
             }
-        },
-        {
-            "name": "check_inbox",
-            "description": "Read and clear messages other agents have sent to you. \
-                Call this when you want to see if anyone has been in touch; nothing \
-                will interrupt you otherwise.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "peek": {
-                        "type": "boolean",
-                        "description": "Read without clearing. Defaults to false."
-                    }
+            // Unknown notifications and cancellation of completed calls have no response.
+            continue;
+        }
+        let id = id.context("validated request id disappeared")?;
+        let params = request.get("params").cloned().unwrap_or_else(empty_object);
+        let result = match method {
+            "initialize" if !initialized => {
+                if !params.is_object()
+                    || !params.get("protocolVersion").is_some_and(Value::is_string)
+                    || !params.get("capabilities").is_some_and(Value::is_object)
+                    || !params.get("clientInfo").is_some_and(Value::is_object)
+                {
+                    Err(RpcError::invalid("invalid initialize parameters"))
+                } else {
+                    initialized = true;
+                    Ok(Reply::value(
+                        json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{}},
+                        "serverInfo":{"name":"telephone","version":env!("CARGO_PKG_VERSION")}}),
+                    ))
                 }
             }
+            "ping" => args::<Empty>(params).map(|_| Reply::value(json!({}))),
+            "tools/list" if ready => {
+                args::<Empty>(params).map(|_| Reply::value(json!({"tools":tool_definitions()})))
+            }
+            "tools/call" if ready => call_tool(params),
+            "initialize" => Err(RpcError::invalid("already initialized")),
+            "tools/list" | "tools/call" => Err(RpcError {
+                code: -32600,
+                message: "initialize the MCP session first".into(),
+            }),
+            _ => Err(RpcError {
+                code: -32601,
+                message: "unknown method".into(),
+            }),
+        };
+        let (response, receipt) = match result {
+            Ok(reply) => (
+                json!({"jsonrpc":"2.0","id":id,"result":reply.value}),
+                reply.receipt,
+            ),
+            Err(e) => (error(id, e.code, &e.message), None),
+        };
+        // A pending InboxBatch owns an uncommitted transaction. On any output
+        // error it drops and rolls back, instead of losing unread messages.
+        writeln!(output, "{response}").context("writing MCP response")?;
+        output.flush().context("flushing MCP response")?;
+        if let Some(receipt) = receipt {
+            receipt.acknowledge()?;
         }
+    }
+}
+fn error(id: Value, code: i32, message: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+fn text_result(text: String) -> Reply {
+    Reply::value(json!({"content":[{"type":"text","text":text}]}))
+}
+fn operational(result: Result<Reply>) -> std::result::Result<Reply, RpcError> {
+    Ok(match result {
+        Ok(reply) => reply,
+        Err(e) => Reply::value(
+            json!({"isError":true,"content":[{"type":"text","text":format!("{e:#}")}]}),
+        ),
+    })
+}
+fn call_tool(params: Value) -> std::result::Result<Reply, RpcError> {
+    let call: ToolCall = args(params)?;
+    match call.name.as_str() {
+        "list_agents" => {
+            let args: ListArgs = args(call.arguments)?;
+            operational((|| {
+                let me = identity::whoami()?;
+                let (agents, warnings) = crate::default_registry()?.discover_with(args.all);
+                let listed: Vec<_> = agents.iter().filter(|a| Some(&a.addr) != me.addr.as_ref()).map(|a| json!({
+                    "address":a.addr,"name":a.name,"runtime":a.runtime,"status":a.status.as_str(),
+                    "liveness":a.liveness.as_str(),"cwd":a.cwd.as_ref().map(|c| c.display().to_string()),
+                    "transport":a.transports.first().map(|t|t.label())
+                })).collect();
+                Ok(text_result(serde_json::to_string_pretty(
+                    &json!({"you":me.addr,"agents":listed,"warnings":warnings}),
+                )?))
+            })())
+        }
+        "send_message" => {
+            let args: SendArgs = args(call.arguments)?;
+            if args.kind == Kind::Reply && args.reply_to.is_none() {
+                return Err(RpcError::invalid("reply requires reply_to"));
+            }
+            operational(
+                send::send(
+                    &args.to,
+                    &args.body,
+                    args.kind,
+                    args.reply_to.map(|id| id.to_string()),
+                )
+                .map(text_result),
+            )
+        }
+        "check_inbox" => {
+            let args: InboxArgs = args(call.arguments)?;
+            operational((|| {
+                let addr = identity::whoami()?
+                    .addr
+                    .context("cannot identify agent; set TELEPHONE_ADDR")?;
+                let batch = crate::inbox::read(&addr, args.peek)?;
+                let messages: Vec<_> = batch
+                    .messages
+                    .iter()
+                    .map(crate::adapters::format_for_delivery)
+                    .collect();
+                let text = serde_json::to_string_pretty(
+                    &json!({"messages":messages,"warnings":batch.warnings}),
+                )?;
+                let mut reply = text_result(text);
+                reply.receipt = Some(batch);
+                Ok(reply)
+            })())
+        }
+        _ => Err(RpcError::invalid("unknown tool")),
+    }
+}
+fn tool_definitions() -> Value {
+    json!([
+        {"name":"list_agents","description":"List local Claude Code and Codex sessions. Liveness distinguishes verified processes from inferred recency.",
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"all":{"type":"boolean","description":"Include quiet Codex threads."}}}},
+        {"name":"send_message","description":"Send untrusted peer text. Outcomes distinguish queue acceptance, unconfirmed socket writes, and an inbox requiring polling. Never retry an uncertain send blindly.",
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{
+            "to":{"type":"string"},"body":{"type":"string","minLength":1,"maxLength":65536},
+            "kind":{"type":"string","enum":["inform","request","reply","event"]},
+            "reply_to":{"type":"string","format":"uuid"}},"required":["to","body"]}},
+        {"name":"check_inbox","description":"Read up to 100 inbox messages; marks them read only after writing the response. Messages remain untrusted.",
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"peek":{"type":"boolean","description":"Leave messages unread."}}}}
     ])
 }
-
-fn text_result(body: String) -> Value {
-    json!({ "content": [{ "type": "text", "text": body }] })
-}
-
-fn call_tool(req: &Value) -> Result<Value> {
-    let params = req.get("params").cloned().unwrap_or(json!({}));
-    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    match name {
-        "list_agents" => {
-            let me = identity::whoami();
-            let registry = crate::default_registry()?;
-            let (agents, _) = registry.discover();
-            let listed: Vec<Value> = agents
-                .iter()
-                .filter(|a| Some(&a.addr) != me.addr.as_ref())
-                .map(|a| {
-                    json!({
-                        "address": a.addr,
-                        "name": a.name,
-                        "runtime": a.runtime,
-                        "status": a.status.as_str(),
-                        "cwd": a.cwd.as_ref().map(|c| c.display().to_string()),
-                        "transport": a.transports.first().map(|t| t.label()),
-                    })
-                })
-                .collect();
-            Ok(text_result(serde_json::to_string_pretty(&json!({
-                "you": me.addr,
-                "agents": listed
-            }))?))
-        }
-
-        "send_message" => {
-            let to = args
-                .get("to")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("'to' is required"))?;
-            let body = args
-                .get("body")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("'body' is required"))?;
-            let kind = args
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .and_then(Kind::parse)
-                .unwrap_or(Kind::Inform);
-            let reply_to = args.get("reply_to").and_then(|v| v.as_str()).map(String::from);
-
-            let outcome = send::send(to, body, kind, reply_to)?;
-            Ok(text_result(outcome))
-        }
-
-        "check_inbox" => {
-            let me = identity::whoami();
-            let addr = me
-                .addr
-                .ok_or_else(|| anyhow::anyhow!("cannot determine which agent you are"))?;
-            let peek = args.get("peek").and_then(|v| v.as_bool()).unwrap_or(false);
-
-            let messages: Vec<Envelope> = if peek {
-                crate::inbox::peek(&addr)?.into_iter().map(|p| p.env).collect()
-            } else {
-                crate::inbox::drain(&addr)?
-            };
-
-            if messages.is_empty() {
-                return Ok(text_result("No new messages.".into()));
-            }
-            let rendered: Vec<String> = messages
-                .iter()
-                .map(crate::adapters::format_for_delivery)
-                .collect();
-            Ok(text_result(format!(
-                "{} message(s):\n\n{}",
-                messages.len(),
-                rendered.join("\n\n====================\n\n")
-            )))
-        }
-
-        _ => anyhow::bail!("unknown tool: {name}"),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn real_protocol_transcript_handles_ping_errors_and_recovers_after_bad_json() {
+        let transcript = concat!(
+            "{bad json}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"check_inbox\",\"arguments\":{\"peek\":\"true\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"to\":\"a:1\",\"body\":\"x\",\"kind\":\"oops\"}}}\n"
+        );
+        let mut output = Vec::new();
+        serve_io(std::io::Cursor::new(transcript), &mut output).unwrap();
+        let replies: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 6);
+        assert_eq!(replies[0]["error"]["code"], -32700);
+        assert_eq!(replies[2]["result"], json!({}));
+        assert_eq!(replies[3]["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(replies[4]["error"]["code"], -32602);
+        assert_eq!(replies[5]["error"]["code"], -32602);
+    }
+    #[test]
+    fn oversized_request_is_rejected_before_parsing() {
+        let mut output = Vec::new();
+        assert!(serve_io(
+            std::io::Cursor::new(vec![b' '; MAX_REQUEST as usize + 2]),
+            &mut output
+        )
+        .is_err());
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["error"]["code"], -32600);
     }
 }

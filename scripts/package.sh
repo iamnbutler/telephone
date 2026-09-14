@@ -23,15 +23,19 @@ else
 fi
 [[ $("$binary" --version) == "telephone $version" ]]
 "$binary" --help >/dev/null
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' |
-  "$binary" mcp | jq -e '.result.tools | map(.name) | sort == ["check_inbox", "list_agents", "send_message"]' >/dev/null
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"package-smoke","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"ping"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' |
+  "$binary" mcp | jq -se 'length == 3 and .[1].result == {} and (.[2].result.tools | map(.name) | sort == ["check_inbox", "list_agents", "send_message"])' >/dev/null
 
 mkdir -p target/release-packages
 staging=$(mktemp -d "$repo_root/target/release-packages/staging.XXXXXX")
 install -m 755 "$binary" "$staging/telephone"
-cp README.md LICENSE "$staging/"
+cp README.md SECURITY.md LICENSE "$staging/"
 archive="$repo_root/target/release-packages/telephone-$target.tar.gz"
-COPYFILE_DISABLE=1 tar -czf "$archive" -C "$staging" telephone README.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$archive" -C "$staging" telephone README.md SECURITY.md LICENSE
 
 # Test the packaged copy, not just the cargo build output.
 extracted=$(mktemp -d "$repo_root/target/release-packages/check.XXXXXX")

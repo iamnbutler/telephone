@@ -21,8 +21,19 @@ pub fn is_alive(pid: u32) -> bool {
     let result = unsafe { libc_kill(pid as i32, 0) };
     // Sandboxes can deny the probe even when the process exists. Only a
     // missing process means dead; permission denied must remain discoverable.
-    result == 0
-        || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+    result == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+}
+
+pub fn positively_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal zero performs only an existence/permission check.
+    unsafe { libc_kill(pid as i32, 0) == 0 }
+}
+
+pub fn start_time_verified(session: Option<u64>, process: Option<&u64>) -> bool {
+    matches!((session, process), (Some(s), Some(&p)) if s.abs_diff(p) <= START_TOLERANCE_MILLIS)
 }
 
 /// The direct parent is useful when a runtime starts an MCP server without
@@ -59,16 +70,40 @@ pub fn start_times(pids: &[u32]) -> HashMap<u32, u64> {
         .collect::<Vec<_>>()
         .join(",");
 
-    let Ok(result) = Command::new("ps").args(["-o", "pid=,etime=", "-p", &list]).output() else {
-        return out;
+    let mut command = Command::new("ps");
+    command.args(["-o", "pid=,etime=", "-p", &list]);
+    let result = match crate::process::run(command, std::time::Duration::from_secs(2)) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::debug(|| format!("process starts could not be verified: {e}"));
+            return out;
+        }
     };
+    if !result.status.success() {
+        crate::debug(|| {
+            format!(
+                "process starts could not be verified: ps exited {}",
+                result.status
+            )
+        });
+        return out;
+    }
     let now = crate::envelope::now_millis();
     for line in String::from_utf8_lossy(&result.stdout).lines() {
         let line = line.trim();
-        let Some((pid, elapsed)) = line.split_once(char::is_whitespace) else { continue };
-        let Ok(pid) = pid.trim().parse::<u32>() else { continue };
-        let Some(seconds) = parse_etime(elapsed.trim()) else { continue };
-        out.insert(pid, now.saturating_sub(seconds * 1000));
+        let Some((pid, elapsed)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        let Some(seconds) = parse_etime(elapsed.trim()) else {
+            continue;
+        };
+        let Some(millis) = seconds.checked_mul(1000) else {
+            continue;
+        };
+        out.insert(pid, now.saturating_sub(millis));
     }
     out
 }
@@ -83,7 +118,13 @@ fn parse_etime(s: &str) -> Option<u64> {
     let seconds = parts.next()?.parse::<u64>().ok()?;
     let minutes = parts.next().unwrap_or("0").parse::<u64>().ok()?;
     let hours = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-    Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+    if parts.next().is_some() || seconds >= 60 || minutes >= 60 {
+        return None;
+    }
+    days.checked_mul(86_400)?
+        .checked_add(hours.checked_mul(3_600)?)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)
 }
 
 /// Whether the process holding a pid started close enough to the session that
@@ -92,7 +133,10 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// Returns `true` when there's nothing to compare: absence of evidence
 /// shouldn't hide a session that is probably fine. This mirrors [`is_alive`],
 /// which also errs toward keeping a session discoverable.
-pub fn start_time_matches(session_started_at: Option<u64>, process_started_at: Option<&u64>) -> bool {
+pub fn start_time_matches(
+    session_started_at: Option<u64>,
+    process_started_at: Option<&u64>,
+) -> bool {
     match (session_started_at, process_started_at) {
         (Some(session), Some(&process)) => session.abs_diff(process) <= START_TOLERANCE_MILLIS,
         _ => true,
@@ -129,7 +173,10 @@ mod tests {
         let started = times.get(&me).expect("ps should report our own pid");
         let now = crate::envelope::now_millis();
         assert!(*started <= now, "we cannot have started in the future");
-        assert!(now - started < 60 * 60 * 1000, "a test process is not an hour old");
+        assert!(
+            now - started < 60 * 60 * 1000,
+            "a test process is not an hour old"
+        );
     }
 
     #[test]
@@ -137,7 +184,10 @@ mod tests {
         assert_eq!(parse_etime("05"), Some(5));
         assert_eq!(parse_etime("01:30"), Some(90));
         assert_eq!(parse_etime("02:00:00"), Some(7_200));
-        assert_eq!(parse_etime("3-04:05:06"), Some(3 * 86_400 + 4 * 3_600 + 5 * 60 + 6));
+        assert_eq!(
+            parse_etime("3-04:05:06"),
+            Some(3 * 86_400 + 4 * 3_600 + 5 * 60 + 6)
+        );
         assert_eq!(parse_etime("nonsense"), None);
     }
 
@@ -147,7 +197,10 @@ mod tests {
         // The process starts a moment before the session records itself.
         assert!(start_time_matches(Some(session), Some(&(session - 800))));
         // Same pid, process started days later: the case that matters.
-        assert!(!start_time_matches(Some(session), Some(&(session + 3 * 86_400_000))));
+        assert!(!start_time_matches(
+            Some(session),
+            Some(&(session + 3 * 86_400_000))
+        ));
         // Nothing recorded, or nothing observed: don't hide the session.
         assert!(start_time_matches(None, Some(&session)));
         assert!(start_time_matches(Some(session), None));

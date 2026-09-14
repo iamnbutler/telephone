@@ -1,105 +1,68 @@
-//! Working out which agent *we* are.
-//!
-//! Sending is easy; knowing your own return address is the awkward part. Each
-//! runtime leaks a different amount of self-knowledge into the environment of
-//! the processes it spawns, so this is a ladder of decreasing confidence.
-
-use crate::registry::Adapter;
+//! Identity is a local routing hint, not authentication. Never guess from cwd.
+use crate::address::Address;
+use anyhow::{bail, Context, Result};
 
 #[derive(Debug, Default)]
 pub struct Me {
     pub addr: Option<String>,
-    pub runtime: Option<&'static str>,
+    pub runtime: Option<String>,
     pub name: Option<String>,
-    /// How we worked it out, so `telephone whoami` can be honest about
-    /// whether this is known or guessed.
     pub source: &'static str,
 }
-
-pub fn whoami() -> Me {
-    // 1. Explicit override. Always wins, and is the escape hatch for any
-    //    runtime this doesn't handle.
-    if let Ok(addr) = std::env::var("TELEPHONE_ADDR") {
-        if !addr.trim().is_empty() {
-            return Me {
-                runtime: addr.split_once(':').map(|(r, _)| leak(r)),
-                name: std::env::var("TELEPHONE_NAME").ok(),
-                addr: Some(addr),
-                source: "TELEPHONE_ADDR",
-            };
-        }
-    }
-
-    // 2. Shell children receive CLAUDE_PID; MCP children may only have their
-    // parent's session record. Both beat Codex variables inherited when Claude
-    // was launched from a Codex session.
-    let claude = crate::adapters::claude_code::ClaudeCode::self_address()
-        .map(|addr| (addr, "CLAUDE_PID"))
-        .or_else(|| {
-            crate::adapters::claude_code::ClaudeCode::parent_address()
-                .map(|addr| (addr, "Claude parent session"))
-        });
-    if let Some((addr, source)) = claude {
-        let name = crate::adapters::claude_code::ClaudeCode::new()
-            .ok()
-            .and_then(|a| a.discover().ok())
-            .and_then(|agents| {
-                agents.into_iter().find(|x| x.addr == addr).map(|x| x.name)
-            });
-        return Me {
-            addr: Some(addr),
-            runtime: Some("claude"),
-            name,
-            source,
-        };
-    }
-
-    // 3. Codex puts the thread id into the environment of everything it
-    //    spawns, including MCP servers, so this is exact rather than inferred.
-    for var in ["CODEX_THREAD_ID", "CODEX_SESSION_ID"] {
-        if let Ok(id) = std::env::var(var) {
-            if !id.trim().is_empty() {
-                let short: String = id.chars().take(8).collect();
-                return Me {
-                    addr: Some(format!("codex:{id}")),
-                    runtime: Some("codex"),
-                    name: Some(format!("codex-{short}")),
-                    source: var,
-                };
-            }
-        }
-    }
-
-    // 4. Older Codex builds leak nothing useful, so fall back to matching the
-    //    most recently touched thread for this cwd. This is a guess, and says so.
-    if std::env::var("CODEX_HOME").is_ok() {
-        if let Some(agent) = codex_self_guess() {
-            return Me {
-                addr: Some(agent.addr),
-                runtime: Some("codex"),
-                name: Some(agent.name),
-                source: "codex thread (inferred from cwd)",
-            };
-        }
-    }
-
-    Me {
-        source: "unknown",
-        ..Default::default()
+fn variable(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("{name} is not valid Unicode")),
     }
 }
-
-fn codex_self_guess() -> Option<crate::registry::Agent> {
-    let cwd = std::env::current_dir().ok()?;
-    let adapter = crate::adapters::codex::Codex::new().ok()?;
-    let mut agents = adapter.discover().ok()?;
-    agents.retain(|a| a.cwd.as_ref() == Some(&cwd));
-    agents.sort_by_key(|a| a.last_seen);
-    agents.pop()
+fn identified(value: String, name: Option<String>, source: &'static str) -> Result<Me> {
+    let address: Address = value
+        .parse()
+        .with_context(|| format!("invalid identity from {source}"))?;
+    if name
+        .as_ref()
+        .is_some_and(|n| n.len() > 256 || n.chars().any(char::is_control))
+    {
+        bail!("invalid TELEPHONE_NAME");
+    }
+    let runtime = address.as_str().split_once(':').map(|(r, _)| r.to_owned());
+    Ok(Me {
+        addr: Some(address.to_string()),
+        runtime,
+        name,
+        source,
+    })
 }
-
-/// Runtime names are `&'static str` throughout; an override can name a runtime
-/// we don't have a compiled-in adapter for, so it gets leaked once at startup.
-fn leak(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+pub fn whoami() -> Result<Me> {
+    if let Some(value) = variable("TELEPHONE_ADDR")? {
+        return identified(value, variable("TELEPHONE_NAME")?, "TELEPHONE_ADDR");
+    }
+    if let Some(address) = crate::adapters::claude_code::ClaudeCode::parent_address()? {
+        return identified(address, None, "Claude parent session");
+    }
+    let claude = variable("CLAUDE_PID")?;
+    let codex = variable("CODEX_THREAD_ID")?;
+    // Both can be inherited when runtimes launch one another. Guessing directs
+    // replies to the wrong agent; an explicit override is safer.
+    if claude.is_some() && codex.is_some() {
+        bail!("conflicting CLAUDE_PID and CODEX_THREAD_ID; set TELEPHONE_ADDR explicitly");
+    }
+    if let Some(pid) = claude {
+        let pid: u32 = pid.parse().context("invalid CLAUDE_PID")?;
+        if pid == 0 || pid > i32::MAX as u32 {
+            bail!("invalid CLAUDE_PID");
+        }
+        return identified(format!("claude:{pid}"), None, "CLAUDE_PID");
+    }
+    if let Some(id) = codex {
+        return identified(format!("codex:{id}"), None, "CODEX_THREAD_ID");
+    }
+    // CODEX_SESSION_ID can describe a session-tree root rather than this thread.
+    // It is deliberately not accepted as a thread return address.
+    Ok(Me {
+        source: "unknown; set TELEPHONE_ADDR",
+        ..Me::default()
+    })
 }

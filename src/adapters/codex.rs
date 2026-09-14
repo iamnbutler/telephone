@@ -65,6 +65,7 @@ use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,15 +79,18 @@ const RUNTIME: &str = "codex";
 /// to know would be worse than admitting we don't.
 const LIVE_WINDOW_MILLIS: u64 = 30 * 60 * 1000;
 
-/// Widens the liveness window, in minutes. `telephone list --all` sets this so
-/// you can see threads that have gone quiet without losing the default's
-/// bias toward "currently running".
+/// Changes the default recency window in minutes; --all bypasses it.
 const WINDOW_ENV: &str = "TELEPHONE_WINDOW_MINS";
 
-fn live_window_millis() -> u64 {
-    match std::env::var(WINDOW_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
-        Some(mins) => mins.saturating_mul(60_000),
-        None => LIVE_WINDOW_MILLIS,
+fn live_window_millis() -> Result<u64> {
+    match std::env::var(WINDOW_ENV) {
+        Ok(value) => value
+            .parse::<u64>()
+            .context("TELEPHONE_WINDOW_MINS must be an unsigned integer")?
+            .checked_mul(60_000)
+            .context("TELEPHONE_WINDOW_MINS is too large"),
+        Err(std::env::VarError::NotPresent) => Ok(LIVE_WINDOW_MILLIS),
+        Err(e) => Err(e).context("reading TELEPHONE_WINDOW_MINS"),
     }
 }
 
@@ -97,42 +101,61 @@ pub struct Codex {
 impl Codex {
     pub fn new() -> Result<Self> {
         // Respect CODEX_HOME so this works for non-default installs.
-        let codex_home = match std::env::var("CODEX_HOME") {
-            Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
-            _ => dirs::home_dir().context("no home directory")?.join(".codex"),
+        let codex_home = match std::env::var_os("CODEX_HOME") {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => dirs::home_dir()
+                .context("no home directory")?
+                .join(".codex"),
         };
         Ok(Codex { codex_home })
     }
 
     /// Codex versions its state database (`state_5.sqlite`, and so on), so
     /// pick the highest version present rather than pinning to one.
-    fn state_db(&self) -> Option<PathBuf> {
+    fn state_db(&self) -> Result<Option<PathBuf>> {
         let mut best: Option<(u32, PathBuf)> = None;
-        for entry in fs::read_dir(&self.codex_home).ok()?.flatten() {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?;
-            let Some(rest) = name.strip_prefix("state_") else { continue };
-            let Some(version) = rest.strip_suffix(".sqlite") else { continue };
-            let Ok(version) = version.parse::<u32>() else { continue };
+        for entry in fs::read_dir(&self.codex_home).context("reading Codex directory")? {
+            let path = entry.context("reading Codex directory entry")?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix("state_") else {
+                continue;
+            };
+            let Some(version) = rest.strip_suffix(".sqlite") else {
+                continue;
+            };
+            let Ok(version) = version.parse::<u32>() else {
+                continue;
+            };
             if best.as_ref().is_none_or(|(b, _)| version > *b) {
                 best = Some((version, path));
             }
         }
-        best.map(|(_, p)| p)
+        Ok(best.map(|(_, p)| p))
     }
 
     fn discover_via_sqlite(&self, cutoff: u64) -> Result<Vec<Agent>> {
-        let db = self.state_db().context("no state database")?;
+        let db = self.state_db()?.context("no state database")?;
+        let metadata = fs::symlink_metadata(&db).context("inspecting Codex database")?;
+        // SAFETY: geteuid has no arguments or caller-owned memory.
+        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!("Codex database must be a regular file owned by this user");
+        }
+        // SQLite NOFOLLOW rejects ancestor aliases too (e.g. macOS /var).
+        // Resolve those only after rejecting a symlink at the database itself.
+        let db = db.canonicalize().context("resolving Codex database path")?;
 
         // Codex holds this open in WAL mode. Read-only is both correct and
         // the only safe thing to do to another process's live database.
         let conn = rusqlite::Connection::open_with_flags(
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("opening {}", db.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
 
         let mut stmt = conn.prepare(
             "SELECT id, cwd, \
@@ -153,9 +176,16 @@ impl Codex {
         })?;
 
         let mut agents = Vec::new();
+        let native = codex_cli().is_some();
         for row in rows {
             let (id, cwd, label, updated) = row?;
-            agents.push(build_agent(&id, cwd, &label, updated.max(0) as u64));
+            agents.push(build_agent(
+                &id,
+                cwd,
+                &label,
+                updated.max(0) as u64,
+                native,
+            )?);
         }
         Ok(agents)
     }
@@ -164,18 +194,30 @@ impl Codex {
     /// appends to a rollout log whose first line is a `session_meta` record.
     fn discover_via_rollouts(&self, cutoff: u64) -> Result<Vec<Agent>> {
         let sessions = self.codex_home.join("sessions");
-        if !sessions.exists() {
+        if !sessions
+            .try_exists()
+            .context("checking rollout directory")?
+        {
             return Ok(Vec::new());
         }
 
         let mut agents = Vec::new();
+        let native = codex_cli().is_some();
         let mut stack = vec![sessions];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
+            let entries =
+                fs::read_dir(&dir).with_context(|| format!("reading rollout directory {dir:?}"))?;
+            for entry in entries {
+                let path = entry.context("reading rollout entry")?.path();
+                let metadata = fs::symlink_metadata(&path).context("inspecting rollout entry")?;
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
                     stack.push(path);
+                    continue;
+                }
+                if !metadata.is_file() {
                     continue;
                 }
                 let is_rollout = path
@@ -185,29 +227,56 @@ impl Codex {
                 if !is_rollout {
                     continue;
                 }
-                let modified = mtime_millis(&path);
+                let modified = mtime_millis(&path)?;
                 if modified < cutoff {
                     continue;
                 }
                 // The meta record is the first line; don't read a whole
                 // transcript just to learn a session id.
-                let Ok(file) = fs::File::open(&path) else { continue };
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(&path)
+                    .with_context(|| format!("opening rollout {path:?}"))?;
                 let mut first = String::new();
                 {
                     use std::io::BufRead;
-                    let mut reader = std::io::BufReader::new(file);
-                    if reader.read_line(&mut first).is_err() {
+                    use std::io::Read;
+                    let mut reader = std::io::BufReader::new(file).take(1024 * 1024 + 1);
+                    reader
+                        .read_line(&mut first)
+                        .with_context(|| format!("reading rollout metadata {path:?}"))?;
+                    if first.len() > 1024 * 1024 {
+                        crate::warn(format!("rollout metadata exceeds size limit: {path:?}"));
                         continue;
                     }
                 }
-                let Ok(line) = serde_json::from_str::<RolloutLine>(&first) else { continue };
+                let line = match serde_json::from_str::<RolloutLine>(&first) {
+                    Ok(line) => line,
+                    Err(e) => {
+                        crate::warn(format!("skipping malformed rollout {path:?}: {e}"));
+                        continue;
+                    }
+                };
                 if line.kind != "session_meta" {
                     continue;
                 }
-                let Ok(meta) = serde_json::from_value::<SessionMeta>(line.payload) else { continue };
-                agents.push(build_agent(&meta.session_id, meta.cwd, "", modified));
+                let meta = match serde_json::from_value::<SessionMeta>(line.payload) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        crate::warn(format!("skipping invalid session metadata {path:?}: {e}"));
+                        continue;
+                    }
+                };
+                let id = meta
+                    .id
+                    .or(meta.session_id)
+                    .context("rollout metadata has no thread id")?;
+                agents.push(build_agent(&id, meta.cwd, "", modified, native)?);
             }
         }
+        agents.sort_by(|a, b| a.addr.cmp(&b.addr).then(b.last_seen.cmp(&a.last_seen)));
+        agents.dedup_by(|a, b| a.addr == b.addr);
         Ok(agents)
     }
 }
@@ -221,11 +290,19 @@ struct RolloutLine {
 
 #[derive(Debug, Deserialize)]
 struct SessionMeta {
-    session_id: String,
+    id: Option<String>,
+    session_id: Option<String>,
     cwd: Option<String>,
 }
 
-fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Agent {
+fn build_agent(
+    id: &str,
+    cwd: Option<String>,
+    label: &str,
+    last_seen: u64,
+    native: bool,
+) -> Result<Agent> {
+    let address: crate::address::Address = format!("{RUNTIME}:{id}").parse()?;
     // Names must be stable: Codex's `name` column holds an auto-generated
     // title that it rewrites as the thread evolves, so routing on it would
     // change an agent's address under the user mid-conversation. Only
@@ -237,8 +314,8 @@ fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Ag
     } else {
         format!("codex-{}", slugify(label))
     };
-    Agent {
-        addr: format!("{RUNTIME}:{id}"),
+    Ok(Agent {
+        addr: address.to_string(),
         runtime: RUNTIME,
         name,
         cwd: cwd.map(PathBuf::from),
@@ -248,12 +325,12 @@ fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Ag
         status: Status::Unknown,
         liveness: Liveness::Inferred,
         last_seen,
-        transports: if codex_cli().is_some() {
+        transports: if native {
             vec![Transport::CodexQueue, Transport::Inbox]
         } else {
             vec![Transport::Inbox]
         },
-    }
+    })
 }
 
 /// Nicknames are free text. Names are for typing at a shell, so keep them
@@ -261,7 +338,13 @@ fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Ag
 fn slugify(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     cleaned
         .split('-')
@@ -271,13 +354,14 @@ fn slugify(s: &str) -> String {
         .join("-")
 }
 
-fn mtime_millis(path: &PathBuf) -> u64 {
-    fs::metadata(path)
+fn mtime_millis(path: &PathBuf) -> Result<u64> {
+    let modified = fs::metadata(path)
         .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .context("reading rollout modification time")?;
+    Ok(modified
+        .duration_since(UNIX_EPOCH)
+        .context("rollout modification time precedes epoch")?
+        .as_millis() as u64)
 }
 
 fn now_millis() -> u64 {
@@ -293,45 +377,71 @@ impl Adapter for Codex {
     }
 
     fn discover(&self) -> Result<Vec<Agent>> {
-        if !self.codex_home.exists() {
+        if !self
+            .codex_home
+            .try_exists()
+            .context("checking Codex directory")?
+        {
             return Ok(Vec::new());
         }
-        let cutoff = now_millis().saturating_sub(live_window_millis());
+        let cutoff = now_millis().saturating_sub(live_window_millis()?);
 
-        // The state database is authoritative for *which* threads exist;
-        // rollouts are the safety net.
+        self.discover_since(cutoff)
+    }
+
+    fn discover_all(&self) -> Result<Vec<Agent>> {
+        self.discover_since(0)
+    }
+
+    fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
+        env.validate()?;
+        if env.to.as_str() != agent.addr {
+            anyhow::bail!("Codex target does not match envelope recipient");
+        }
+        let thread = agent
+            .addr
+            .strip_prefix("codex:")
+            .context("invalid Codex address")?;
+        if let Some(cli) = codex_cli() {
+            // Capability probing is read-only. A missing/unsupported command is
+            // safe to fall back from; an actual send failure is not.
+            let mut probe = Command::new(&cli);
+            probe.args(["queue", "--help"]);
+            match crate::process::run(probe, std::time::Duration::from_secs(3)) {
+                Ok(out) if out.status.success() => {
+                    queue_message(&cli, thread, env)?;
+                    return Ok(Delivered::Accepted { via: "codex queue" });
+                }
+                Ok(_) => crate::debug(|| "codex queue is unsupported; using inbox".into()),
+                Err(e) => {
+                    crate::debug(|| format!("codex capability probe failed: {e}; using inbox"))
+                }
+            }
+        }
+        let path = inbox::deposit(&agent.addr, env)?;
+        Ok(Delivered::Queued {
+            path,
+            note: "native queue unavailable; recipient must check its Telephone inbox".into(),
+        })
+    }
+}
+
+impl Codex {
+    fn discover_since(&self, cutoff: u64) -> Result<Vec<Agent>> {
+        if !self
+            .codex_home
+            .try_exists()
+            .context("checking Codex home")?
+        {
+            return Ok(Vec::new());
+        }
         match self.discover_via_sqlite(cutoff) {
-            Ok(agents) if !agents.is_empty() => Ok(agents),
-            Ok(_) => self.discover_via_rollouts(cutoff),
+            Ok(agents) => Ok(agents),
             Err(e) => {
                 crate::debug(|| format!("codex: state db unreadable ({e}); using rollouts"));
                 self.discover_via_rollouts(cutoff)
             }
         }
-    }
-
-    fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
-        let thread = agent
-            .addr
-            .split_once(':')
-            .map(|(_, id)| id)
-            .unwrap_or(&agent.addr);
-
-        if let Some(cli) = codex_cli() {
-            match queue_message(&cli, thread, env) {
-                Ok(()) => return Ok(Delivered::Native { via: "codex queue" }),
-                Err(e) => crate::debug(|| format!("codex: queue failed ({e}); using inbox")),
-            }
-        }
-
-        let path = inbox::deposit(&agent.addr, env)?;
-        Ok(Delivered::Queued {
-            path,
-            note: "the codex CLI wasn't usable, so this is waiting in the inbox; \
-                   Codex will see it when it calls the telephone MCP server's \
-                   check_inbox tool"
-                .into(),
-        })
     }
 }
 
@@ -344,35 +454,118 @@ fn codex_cli() -> Option<PathBuf> {
     // it the most reliable source when we're running under Codex ourselves.
     if let Ok(p) = std::env::var("CODEX_CLI_PATH") {
         let path = PathBuf::from(p);
-        if path.is_file() {
+        if executable(&path) {
             return Some(path);
         }
     }
-    if let Ok(out) = Command::new("sh").arg("-c").arg("command -v codex").output() {
-        let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !found.is_empty() {
-            return Some(PathBuf::from(found));
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            let candidate = directory.join("codex");
+            if executable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     let bundled = PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex");
-    bundled.is_file().then_some(bundled)
+    executable(&bundled).then_some(bundled)
+}
+
+fn executable(path: &std::path::Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Pushes a message into a Codex thread's queue.
 fn queue_message(cli: &PathBuf, thread: &str, env: &Envelope) -> Result<()> {
-    let out = Command::new(cli)
+    let mut command = Command::new(cli);
+    command
         .arg("queue")
-        .arg("--thread")
-        .arg(thread)
-        .arg("--message")
-        .arg(crate::adapters::format_for_delivery(env))
-        .output()
-        .context("running `codex queue`")?;
+        .arg(format!("--thread={thread}"))
+        .arg(format!(
+            "--message={}",
+            crate::adapters::format_for_delivery(env)
+        ));
+    let out = crate::process::run(command, std::time::Duration::from_secs(8))
+        .context("codex queue did not confirm acceptance; no automatic retry or fallback")?;
 
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("codex queue failed: {}", err.trim());
+        anyhow::bail!(
+            "codex queue failed; delivery is unconfirmed and was not retried: {:?}",
+            err.trim()
+        );
     }
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn special_files_cannot_block_discovery() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        for path in [
+            temp.path().join("state_5.sqlite"),
+            sessions.join("rollout-pipe.jsonl"),
+        ] {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: path is a live NUL-terminated string inside this test's tempdir.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        let adapter = Codex {
+            codex_home: temp.path().to_owned(),
+        };
+        assert!(adapter.discover_via_sqlite(0).is_err());
+        assert!(adapter.discover_via_rollouts(0).unwrap().is_empty());
+    }
+    #[test]
+    fn real_rollout_files_keep_thread_ids_distinct_from_session_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("sessions");
+        fs::create_dir(&dir).unwrap();
+        for (file, payload) in [
+            (
+                "rollout-child.jsonl",
+                serde_json::json!({"id":"child", "session_id":"root", "cwd":"/example"}),
+            ),
+            (
+                "rollout-old.jsonl",
+                serde_json::json!({"id":"older", "cwd":"/example"}),
+            ),
+        ] {
+            fs::write(
+                dir.join(file),
+                serde_json::json!({"type":"session_meta", "payload":payload}).to_string(),
+            )
+            .unwrap();
+        }
+        let adapter = Codex {
+            codex_home: temp.path().to_owned(),
+        };
+        let agents = adapter.discover_via_rollouts(0).unwrap();
+        assert_eq!(
+            agents.iter().map(|a| a.addr.as_str()).collect::<Vec<_>>(),
+            vec!["codex:child", "codex:older"]
+        );
+    }
+    #[test]
+    fn exact_resolution_can_find_quiet_threads_in_a_real_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(temp.path().join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads(id TEXT,cwd TEXT,agent_nickname TEXT,updated_at_ms INTEGER,updated_at INTEGER,archived INTEGER);
+            INSERT INTO threads VALUES('old','/example','',1,0,0);
+            INSERT INTO threads VALUES('archived','/example','',1,0,1);").unwrap();
+        let adapter = Codex {
+            codex_home: temp.path().to_owned(),
+        };
+        assert!(adapter.discover_via_sqlite(2).unwrap().is_empty());
+        let registry = crate::registry::Registry::new(vec![Box::new(adapter)]);
+        assert_eq!(
+            registry.resolve(&[], "codex:old").unwrap().addr,
+            "codex:old"
+        );
+        assert!(registry.resolve(&[], "codex:archived").is_err());
+    }
+}

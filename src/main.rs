@@ -6,38 +6,68 @@
 //! one address space and one message format, and supplies a universal fallback
 //! for the runtimes that offer nothing at all.
 
+#![deny(unused_must_use)]
+#![deny(clippy::undocumented_unsafe_blocks, clippy::let_underscore_must_use)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::dbg_macro
+    )
+)]
+
 mod adapters;
+mod address;
 mod envelope;
 mod identity;
 mod inbox;
 mod mcp;
+mod private_fs;
 mod proc;
+mod process;
 mod registry;
 mod send;
+mod store;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use envelope::Kind;
 use registry::{Adapter, Registry};
+use std::io::Write;
 
 /// Diagnostics for the paths that silently fall back, gated behind
 /// `TELEPHONE_DEBUG`. Fallbacks that are invisible are indistinguishable from
 /// bugs, and this is the cheapest way to tell them apart.
 pub fn debug(msg: impl FnOnce() -> String) {
     if std::env::var("TELEPHONE_DEBUG").is_ok() {
-        eprintln!("debug: {}", msg());
+        diagnostic("debug", &msg());
     }
+}
+
+pub fn warn(message: impl std::fmt::Display) {
+    diagnostic("warning", &message.to_string());
+}
+
+fn diagnostic(level: &str, message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    if writeln!(stderr, "{level}: {}", serde_json::json!(message)).is_err() {
+        // stderr is the last-resort diagnostic channel. Do not panic during
+        // cleanup or retry a side effect because its warning could not print.
+    }
+}
+
+fn console_text(value: &str) -> String {
+    value.escape_debug().to_string()
 }
 
 /// Every adapter telephone knows about, in preference order.
 pub fn default_registry() -> Result<Registry> {
-    let mut adapters: Vec<Box<dyn Adapter>> = Vec::new();
-    if let Ok(a) = adapters::claude_code::ClaudeCode::new() {
-        adapters.push(Box::new(a));
-    }
-    if let Ok(a) = adapters::codex::Codex::new() {
-        adapters.push(Box::new(a));
-    }
+    let adapters: Vec<Box<dyn Adapter>> = vec![
+        Box::new(adapters::claude_code::ClaudeCode::new()?),
+        Box::new(adapters::codex::Codex::new()?),
+    ];
     Ok(Registry::new(adapters))
 }
 
@@ -102,14 +132,36 @@ enum Command {
     Install,
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            diagnostic("error", &format!("{e:#}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::List { json, all } => cmd_list(json, all),
-        Command::Send { to, body, kind, reply_to } => {
+        Command::Send {
+            to,
+            body,
+            kind,
+            reply_to,
+        } => {
             let kind = Kind::parse(&kind)
                 .ok_or_else(|| anyhow::anyhow!("kind must be inform, request, reply or event"))?;
-            println!("{}", send::send(&to, &body, kind, reply_to)?);
+            let report = send::send(&to, &body, kind, reply_to)?;
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{report}").context(
+                "writing send report; delivery may already have occurred, do not retry blindly",
+            )?;
+            stdout
+                .flush()
+                .context("flushing send report; delivery may already have occurred")?;
             Ok(())
         }
         Command::Inbox { peek, json } => cmd_inbox(peek, json),
@@ -121,16 +173,14 @@ fn main() -> Result<()> {
 }
 
 fn cmd_list(json: bool, all: bool) -> Result<()> {
-    if all {
-        // A week is "anything you might plausibly still care about".
-        // Effectively no cutoff.
-        std::env::set_var("TELEPHONE_WINDOW_MINS", "5256000");
-    }
-    let me = identity::whoami();
+    let me = identity::whoami()?;
     let registry = default_registry()?;
-    let (agents, warnings) = registry.discover();
+    let (agents, warnings) = registry.discover_with(all);
 
     if json {
+        for warning in &warnings {
+            warn(warning);
+        }
         let out: Vec<serde_json::Value> = agents
             .iter()
             .map(|a| {
@@ -157,7 +207,11 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
     // Size the columns to what's actually present: Codex addresses are a
     // runtime prefix plus a uuid, and a fixed width either truncates them or
     // wastes half the terminal when no Codex threads are around.
-    let name_width = agents.iter().map(|a| a.name.len()).max().unwrap_or(0);
+    let name_width = agents
+        .iter()
+        .map(|a| console_text(&a.name).len())
+        .max()
+        .unwrap_or(0);
     let addr_width = agents.iter().map(|a| a.addr.len()).max().unwrap_or(0);
 
     for a in &agents {
@@ -167,11 +221,11 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
         let cwd = a
             .cwd
             .as_ref()
-            .map(|c| c.display().to_string())
+            .map(|c| console_text(&c.display().to_string()))
             .unwrap_or_default();
         println!(
             "{marker} {:<name_width$}  {:<addr_width$}  {:<7}  {:<7}  {:<5}  {}",
-            a.name,
+            console_text(&a.name),
             a.addr,
             a.status.as_str(),
             a.liveness.as_str(),
@@ -190,18 +244,16 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
         println!("* = you");
     }
     if inferred {
-        println!(
-            "recent? = was active recently, but nothing could confirm it is still running"
-        );
+        println!("recent? = was active recently, but nothing could confirm it is still running");
     }
     for w in warnings {
-        eprintln!("warning: {w}");
+        warn(w);
     }
     Ok(())
 }
 
 fn cmd_inbox(peek: bool, json: bool) -> Result<()> {
-    let me = identity::whoami();
+    let me = identity::whoami()?;
     let Some(addr) = me.addr else {
         anyhow::bail!(
             "can't tell which agent you are; set TELEPHONE_ADDR to your address \
@@ -209,28 +261,32 @@ fn cmd_inbox(peek: bool, json: bool) -> Result<()> {
         );
     };
 
-    let messages: Vec<envelope::Envelope> = if peek {
-        inbox::peek(&addr)?.into_iter().map(|p| p.env).collect()
+    let batch = inbox::read(&addr, peek)?;
+    for warning in &batch.warnings {
+        warn(warning);
+    }
+    let rendered = if json {
+        serde_json::to_string_pretty(&batch.messages)?
+    } else if batch.messages.is_empty() {
+        "No new messages.".into()
     } else {
-        inbox::drain(&addr)?
+        batch
+            .messages
+            .iter()
+            .map(adapters::format_for_delivery)
+            .collect::<Vec<_>>()
+            .join("\n\n")
     };
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&messages)?);
-        return Ok(());
-    }
-    if messages.is_empty() {
-        println!("No new messages.");
-        return Ok(());
-    }
-    for m in &messages {
-        println!("{}\n", m.render());
-    }
-    Ok(())
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{rendered}").context("writing inbox; messages remain unread on failure")?;
+    stdout
+        .flush()
+        .context("flushing inbox; messages remain unread on failure")?;
+    batch.acknowledge()
 }
 
 fn cmd_whoami() -> Result<()> {
-    let me = identity::whoami();
+    let me = identity::whoami()?;
     match &me.addr {
         Some(addr) => {
             println!("address: {addr}");
@@ -251,8 +307,11 @@ fn cmd_whoami() -> Result<()> {
 }
 
 fn cmd_doctor() -> Result<()> {
-    let me = identity::whoami();
-    println!("you:        {}", me.addr.clone().unwrap_or_else(|| "unknown".into()));
+    let me = identity::whoami()?;
+    println!(
+        "you:        {}",
+        me.addr.clone().unwrap_or_else(|| "unknown".into())
+    );
     println!("via:        {}", me.source);
     println!("inbox root: {}", inbox::root()?.display());
 
@@ -265,7 +324,10 @@ fn cmd_doctor() -> Result<()> {
                 let native = found
                     .iter()
                     .filter(|a| {
-                        !matches!(a.transports.first(), None | Some(registry::Transport::Inbox))
+                        !matches!(
+                            a.transports.first(),
+                            None | Some(registry::Transport::Inbox)
+                        )
                     })
                     .count();
                 let confirmed = found
@@ -282,7 +344,11 @@ fn cmd_doctor() -> Result<()> {
                     found.len()
                 );
             }
-            Err(e) => println!("  {:<8} error    {e}", adapter.runtime()),
+            Err(e) => println!(
+                "  {:<8} error    {}",
+                adapter.runtime(),
+                console_text(&e.to_string())
+            ),
         }
     }
 
@@ -291,15 +357,16 @@ fn cmd_doctor() -> Result<()> {
         println!(
             "\nsome agents could not be confirmed live.\n  \
              Claude Code sessions are confirmed by pid and process start time.\n  \
-             Codex threads are confirmed only when the daemon that owns them can\n  \
-             be reached; otherwise the signal is recency, which cannot tell a\n  \
+             Codex threads use recency, which cannot tell a\n  \
              running thread from one that exited just after its last write."
         );
     }
 
     if let Some(addr) = &me.addr {
-        let waiting = inbox::peek(addr)?.len();
+        let batch = inbox::read(addr, true)?;
+        let waiting = batch.messages.len();
         println!("\ninbox:      {waiting} message(s) waiting");
+        batch.acknowledge()?;
     }
     Ok(())
 }
@@ -310,16 +377,21 @@ fn cmd_doctor() -> Result<()> {
 /// this tool should not be in the business of causing.
 fn cmd_install() -> Result<()> {
     let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "telephone".into());
+        .context("locating telephone executable for setup")?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("executable path is not valid Unicode"))?;
 
     println!("Claude Code -- run this:\n");
-    println!("  claude mcp add telephone -s user -- {exe} mcp\n");
+    println!(
+        "  claude mcp add telephone -s user -- {} mcp\n",
+        address::shell_quote(&exe)
+    );
     println!("Codex -- add this to ~/.codex/config.toml:\n");
     println!("  [mcp_servers.telephone]");
-    println!("  command = \"{exe}\"");
+    println!("  command = {}", serde_json::to_string(&exe)?);
     println!("  args = [\"mcp\"]\n");
-    println!("Any other runtime that speaks MCP over stdio: run `{exe} mcp`.");
+    println!("Only Claude Code and Codex are currently discoverable.");
     println!("If it can't tell you which agent it is, set TELEPHONE_ADDR in its");
     println!("environment (see `telephone whoami`).");
     Ok(())

@@ -55,6 +55,6 @@ From a separate terminal, pass the desired Codex address explicitly:
 bash scripts/demo-claude.sh codex:<thread-id>
 ```
 
-See [README.md](README.md#codex--claude-code-demo) for the request command,
-prerequisites, and queue/inbox behavior. The Claude PID changes each launch;
+See [README.md](README.md#use) for usage and [SECURITY.md](SECURITY.md) for
+delivery limits and upgrade notes. The Claude PID changes each launch;
 use the new address reported by `list_agents`.
