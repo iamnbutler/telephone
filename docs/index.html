@@ -19,7 +19,7 @@
     <div class="page">
       <aside class="sidebar">
         <a class="name" href="./">telephone</a>
-        <p class="version">Version 0.1.0</p>
+        <p class="version"><a href="https://github.com/iamnbutler/telephone/releases/latest">Latest release</a></p>
         <nav aria-label="Contents">
           <ul>
             <li><a href="#connect">Install</a></li>
@@ -57,23 +57,8 @@ telephone install</code></pre>
             </tbody>
           </table>
           <p><a href="https://github.com/iamnbutler/telephone/releases/latest/download/SHA256SUMS">SHA-256 checksums</a> · <a href="https://github.com/iamnbutler/telephone/releases">All releases</a></p>
-          <p>Check the download against its checksum, then extract and install it. For example, on Apple Silicon:</p>
-          <pre tabindex="0" aria-label="Installation commands"><code>telephone_unpack=$(mktemp -d)
-tar -xzf telephone-aarch64-apple-darwin.tar.gz -C "$telephone_unpack"
-mkdir -p "$HOME/.local/bin"
-install -m 755 "$telephone_unpack/telephone" "$HOME/.local/bin/telephone"
-export PATH="$HOME/.local/bin:$PATH"
-telephone install</code></pre>
-          <p>Use the archive for your CPU and keep <code>~/.local/bin</code> on your PATH. <code>telephone install</code> prints the setup instructions for your agents; it does not change their configuration.</p>
-          <p>Linux binaries are statically linked. macOS binaries are not Developer ID signed or notarized, so macOS may require explicit approval. Windows is not supported.</p>
-          <details>
-            <summary>Build from source</summary>
-            <p>Requires <a href="https://rustup.rs/">Rust</a>.</p>
-            <pre tabindex="0" aria-label="Source build commands"><code>git clone https://github.com/iamnbutler/telephone.git
-cd telephone
-cargo install --locked --path .
-telephone install</code></pre>
-          </details>
+          <p>Verify the checksum, extract <code>telephone</code>, and put it on your PATH. Run <code>telephone install</code> for agent setup instructions.</p>
+          <p>The v0.1.1 macOS downloads are not Developer ID signed or notarized.</p>
         </section>
 
         <section id="exchange" aria-labelledby="example-title">
