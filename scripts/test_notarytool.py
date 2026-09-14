@@ -44,13 +44,16 @@ class NotarytoolTests(unittest.TestCase):
         self.assertEqual(run_bounded([sys.executable, "-c", "raise SystemExit(7)"], 5), 7)
         self.assertEqual(run_bounded([sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"], 5), 143)
 
-    def test_real_notarytool_version(self):
+    def test_real_notarytool_commands(self):
+        # Some runner images report "unknown (0)" as their tool version. Check
+        # the actual CLI capabilities rather than treating that label as semver.
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name("notarytool.py")), "10", "--version"],
+            [sys.executable, str(Path(__file__).with_name("notarytool.py")), "10", "--help"],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout, r"\d+\.\d+")
+        self.assertIn("store-credentials", result.stdout)
+        self.assertIn("submit", result.stdout)
 
 
 if __name__ == "__main__":
