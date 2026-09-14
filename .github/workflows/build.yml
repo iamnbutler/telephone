@@ -108,7 +108,9 @@ jobs:
           )
           for archive in "${archives[@]}"; do
             test -s "$archive"
-            tar -tzf "$archive" | grep -qx telephone
+            # Read the entire listing: grep -q can close the pipe early and
+            # make tar fail with SIGPIPE under bash's pipefail option.
+            tar -tzf "$archive" | grep -x telephone > /dev/null
           done
           sha256sum "${archives[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
