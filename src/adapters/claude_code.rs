@@ -47,10 +47,6 @@ struct SessionRecord {
     status_updated_at: Option<u64>,
     #[serde(rename = "startedAt")]
     started_at: Option<u64>,
-    /// Process start time, used to tell this session apart from a later
-    /// process that happens to inherit its pid.
-    #[serde(rename = "procStart")]
-    proc_start: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,4 +237,28 @@ fn send_uds(socket: &PathBuf, session_id: &str, token: &str, env: &Envelope) -> 
     writeln!(stream, "{msg}")?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_records_accept_present_or_absent_proc_start() {
+        for proc_start in [None, Some("Mon Sep 14 12:00:00 2026")] {
+            let mut value = serde_json::json!({
+                "pid": 12345,
+                "sessionId": "example-session",
+                "startedAt": 1_789_395_543_000u64,
+            });
+            if let Some(start) = proc_start {
+                value["procStart"] = serde_json::json!(start);
+            }
+
+            let record: SessionRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(record.pid, 12345);
+            assert_eq!(record.session_id, "example-session");
+            assert_eq!(record.started_at, Some(1_789_395_543_000));
+        }
+    }
 }
