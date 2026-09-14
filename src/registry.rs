@@ -123,7 +123,8 @@ impl Registry {
                 Err(e) => warnings.push(format!("{}: {e}", adapter.runtime())),
             }
         }
-        agents.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        // Most recently active first.
+        agents.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
         (agents, warnings)
     }
 
