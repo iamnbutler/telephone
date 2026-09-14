@@ -34,7 +34,6 @@ timeout, check the saved ID before retrying: Apple may still be processing it.
 
 Standalone binaries cannot have notarization tickets stapled to them; Gatekeeper
 retrieves the ticket online. The distributed tar.gz is unchanged by notarization.
-Existing v0.1.1 downloads remain ad-hoc signed and unnotarized; do not change them.
 
 `bash scripts/test-sign-macos.sh` tests signing preflight and failed-import
 cleanup using real macOS tools. A successful signing job also checks the Apple
