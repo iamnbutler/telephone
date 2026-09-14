@@ -59,6 +59,7 @@
 //! The honest summary: for desktop-owned threads this is not currently
 //! knowable from outside, and `notLoaded` means "cannot tell", never "dead".
 
+use crate::discovery::{self, Budget, Code, Discovery, MAX_AGENTS};
 use crate::envelope::Envelope;
 use crate::inbox;
 use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
@@ -110,174 +111,239 @@ impl Codex {
         Ok(Codex { codex_home })
     }
 
-    /// Codex versions its state database (`state_5.sqlite`, and so on), so
-    /// pick the highest version present rather than pinning to one.
-    fn state_db(&self) -> Result<Option<PathBuf>> {
-        let mut best: Option<(u32, PathBuf)> = None;
-        for entry in fs::read_dir(&self.codex_home).context("reading Codex directory")? {
-            let path = entry.context("reading Codex directory entry")?.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix("state_") else {
-                continue;
-            };
-            let Some(version) = rest.strip_suffix(".sqlite") else {
-                continue;
-            };
-            let Ok(version) = version.parse::<u32>() else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(b, _)| version > *b) {
-                best = Some((version, path));
-            }
+    /// State-version selection is itself bounded; never silently select an
+    /// older database after a truncated directory scan.
+    fn state_db(&self, budget: &mut Budget, report: &mut Discovery) -> Result<Option<PathBuf>> {
+        let paths = discovery::files(
+            &self.codex_home,
+            false,
+            |path| {
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with("state_") && name.ends_with(".sqlite"))
+            },
+            RUNTIME,
+            budget,
+            report,
+        );
+        if !report.complete {
+            anyhow::bail!(
+                "cannot determine the latest Codex state database from an incomplete scan"
+            );
         }
-        Ok(best.map(|(_, p)| p))
+        Ok(paths
+            .into_iter()
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?;
+                let version = name
+                    .strip_prefix("state_")?
+                    .strip_suffix(".sqlite")?
+                    .parse::<u32>()
+                    .ok()?;
+                Some((version, path))
+            })
+            .max_by_key(|(v, _)| *v)
+            .map(|(_, p)| p))
     }
 
-    fn discover_via_sqlite(&self, cutoff: u64) -> Result<Vec<Agent>> {
-        let db = self.state_db()?.context("no state database")?;
+    fn discover_via_sqlite(
+        &self,
+        cutoff: u64,
+        exact: Option<&str>,
+        budget: &mut Budget,
+        report: &mut Discovery,
+    ) -> Result<bool> {
+        let Some(db) = self.state_db(budget, report)? else {
+            return Ok(false);
+        };
         let metadata = fs::symlink_metadata(&db).context("inspecting Codex database")?;
         // SAFETY: geteuid has no arguments or caller-owned memory.
         if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
             anyhow::bail!("Codex database must be a regular file owned by this user");
         }
-        // SQLite NOFOLLOW rejects ancestor aliases too (e.g. macOS /var).
-        // Resolve those only after rejecting a symlink at the database itself.
         let db = db.canonicalize().context("resolving Codex database path")?;
-
-        // Codex holds this open in WAL mode. Read-only is both correct and
-        // the only safe thing to do to another process's live database.
         let conn = rusqlite::Connection::open_with_flags(
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                 | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .with_context(|| format!("opening {}", db.display()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(2))?;
-
-        let mut stmt = conn.prepare(
-            "SELECT id, cwd, \
-                    COALESCE(NULLIF(agent_nickname, ''), '') AS label, \
-                    COALESCE(updated_at_ms, updated_at * 1000) AS updated \
-             FROM threads \
-             WHERE archived = 0 \
-               AND COALESCE(updated_at_ms, updated_at * 1000) >= ?1 \
-             ORDER BY updated DESC",
-        )?;
-
-        let rows = stmt.query_map([cutoff as i64], |row| {
-            let id: String = row.get(0)?;
-            let cwd: Option<String> = row.get(1)?;
-            let label: String = row.get(2)?;
-            let updated: i64 = row.get(3)?;
-            Ok((id, cwd, label, updated))
-        })?;
-
-        let mut agents = Vec::new();
+        .context("opening Codex state database")?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))
+            .context("setting discovery lock timeout")?;
+        conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 64 * 1024)
+            .context("limiting discovery row size")?;
+        let deadline = budget.deadline;
+        let mut ticks = 0u32;
+        conn.progress_handler(
+            1000,
+            Some(move || {
+                ticks += 1;
+                ticks >= 5000 || std::time::Instant::now() >= deadline
+            }),
+        )
+        .context("setting discovery SQL work budget")?;
+        // Exact lookup has its own indexed predicate, not a search through the
+        // first page of recent threads. All SQL values remain bound parameters.
+        let (filter, value) = match exact {
+            Some(id) => ("id = ?1", rusqlite::types::Value::Text(id.to_owned())),
+            None => (
+                "COALESCE(updated_at_ms, updated_at * 1000) >= ?1",
+                rusqlite::types::Value::Integer(cutoff.min(i64::MAX as u64) as i64),
+            ),
+        };
+        let sql = format!("SELECT id,cwd,COALESCE(NULLIF(agent_nickname,''),''),COALESCE(updated_at_ms,updated_at*1000)
+            FROM threads WHERE archived=0 AND {filter} ORDER BY COALESCE(updated_at_ms,updated_at*1000) DESC LIMIT ?2");
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("preparing bounded Codex discovery")?;
+        let mut rows = stmt
+            .query(rusqlite::params![value, (MAX_AGENTS + 1) as i64])
+            .context("querying Codex discovery")?;
         let native = codex_cli().is_some();
-        for row in rows {
-            let (id, cwd, label, updated) = row?;
-            agents.push(build_agent(
-                &id,
-                cwd,
-                &label,
-                updated.max(0) as u64,
-                native,
-            )?);
+        let mut count = 0;
+        loop {
+            if !budget.check(RUNTIME, report) {
+                break;
+            }
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(e) => {
+                    let code = match &e {
+                        rusqlite::Error::SqliteFailure(error, _)
+                            if error.code == rusqlite::ErrorCode::OperationInterrupted =>
+                        {
+                            Code::LimitReached
+                        }
+                        _ => Code::Unreadable,
+                    };
+                    report.warn(
+                        RUNTIME,
+                        code,
+                        Some(&db),
+                        format!("state query stopped (including SQL work/time limits): {e}"),
+                    );
+                    break;
+                }
+            };
+            count += 1;
+            if count > MAX_AGENTS {
+                report.warn(
+                    RUNTIME,
+                    Code::LimitReached,
+                    Some(&db),
+                    "state result limit reached (256); use an exact address",
+                );
+                break;
+            }
+            let decoded = (|| -> Result<Agent> {
+                let id: String = row.get(0).context("reading thread id")?;
+                let cwd: Option<String> = row.get(1).context("reading thread directory")?;
+                let label: String = row.get(2).context("reading thread nickname")?;
+                let updated: i64 = row.get(3).context("reading thread timestamp")?;
+                budget.bytes = budget
+                    .bytes
+                    .saturating_sub(id.len() + cwd.as_ref().map_or(0, String::len) + label.len());
+                build_agent(&id, cwd, &label, updated.max(0) as u64, native)
+            })();
+            match decoded {
+                Ok(agent) => {
+                    if !report.push(agent) {
+                        break;
+                    }
+                }
+                Err(e) => report.warn(RUNTIME, Code::InvalidRecord, Some(&db), format!("{e:#}")),
+            }
         }
-        Ok(agents)
+        Ok(true)
     }
 
-    /// Fallback for when the state database can't be read: every live thread
-    /// appends to a rollout log whose first line is a `session_meta` record.
-    fn discover_via_rollouts(&self, cutoff: u64) -> Result<Vec<Agent>> {
+    fn discover_via_rollouts(
+        &self,
+        cutoff: u64,
+        exact: Option<&str>,
+        budget: &mut Budget,
+        report: &mut Discovery,
+    ) {
         let sessions = self.codex_home.join("sessions");
-        if !sessions
-            .try_exists()
-            .context("checking rollout directory")?
-        {
-            return Ok(Vec::new());
-        }
-
-        let mut agents = Vec::new();
-        let native = codex_cli().is_some();
-        let mut stack = vec![sessions];
-        while let Some(dir) = stack.pop() {
-            let entries =
-                fs::read_dir(&dir).with_context(|| format!("reading rollout directory {dir:?}"))?;
-            for entry in entries {
-                let path = entry.context("reading rollout entry")?.path();
-                let metadata = fs::symlink_metadata(&path).context("inspecting rollout entry")?;
-                if metadata.file_type().is_symlink() {
-                    continue;
-                }
-                if metadata.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !metadata.is_file() {
-                    continue;
-                }
-                let is_rollout = path
-                    .file_name()
+        let paths = discovery::files(
+            &sessions,
+            true,
+            |path| {
+                path.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
-                if !is_rollout {
-                    continue;
-                }
-                let modified = mtime_millis(&path)?;
-                if modified < cutoff {
-                    continue;
-                }
-                // The meta record is the first line; don't read a whole
-                // transcript just to learn a session id.
+                    .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+            },
+            RUNTIME,
+            budget,
+            report,
+        );
+        let native = codex_cli().is_some();
+        for path in paths {
+            if !budget.check(RUNTIME, report) {
+                break;
+            }
+            let mut failure_code = Code::Unreadable;
+            let result = (|| -> Result<Option<Agent>> {
+                use std::io::{BufRead, Read};
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                     .open(&path)
-                    .with_context(|| format!("opening rollout {path:?}"))?;
-                let mut first = String::new();
-                {
-                    use std::io::BufRead;
-                    use std::io::Read;
-                    let mut reader = std::io::BufReader::new(file).take(1024 * 1024 + 1);
-                    reader
-                        .read_line(&mut first)
-                        .with_context(|| format!("reading rollout metadata {path:?}"))?;
-                    if first.len() > 1024 * 1024 {
-                        crate::warn(format!("rollout metadata exceeds size limit: {path:?}"));
-                        continue;
-                    }
+                    .context("opening rollout")?;
+                let metadata = file.metadata().context("inspecting open rollout")?;
+                // SAFETY: geteuid has no arguments or caller-owned memory.
+                if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+                    failure_code = Code::InvalidRecord;
+                    anyhow::bail!("rollout must be a regular file owned by this user");
                 }
-                let line = match serde_json::from_str::<RolloutLine>(&first) {
-                    Ok(line) => line,
-                    Err(e) => {
-                        crate::warn(format!("skipping malformed rollout {path:?}: {e}"));
-                        continue;
-                    }
-                };
+                let modified = metadata
+                    .modified()
+                    .context("reading rollout timestamp")?
+                    .duration_since(UNIX_EPOCH)
+                    .context("rollout timestamp precedes epoch")?
+                    .as_millis() as u64;
+                if modified < cutoff {
+                    return Ok(None);
+                }
+                let cap = budget.bytes.min(1024 * 1024);
+                let mut raw = Vec::new();
+                let read =
+                    std::io::BufReader::new(file.take(cap as u64 + 1)).read_until(b'\n', &mut raw);
+                budget.bytes = budget.bytes.saturating_sub(raw.len());
+                read.context("reading rollout metadata")?;
+                failure_code = Code::InvalidRecord;
+                if raw.len() > cap {
+                    anyhow::bail!("rollout metadata exceeds byte limit");
+                }
+                let line: RolloutLine =
+                    serde_json::from_slice(&raw).context("invalid rollout JSON")?;
                 if line.kind != "session_meta" {
-                    continue;
+                    anyhow::bail!("rollout does not start with session metadata");
                 }
-                let meta = match serde_json::from_value::<SessionMeta>(line.payload) {
-                    Ok(meta) => meta,
-                    Err(e) => {
-                        crate::warn(format!("skipping invalid session metadata {path:?}: {e}"));
-                        continue;
-                    }
-                };
+                let meta: SessionMeta =
+                    serde_json::from_value(line.payload).context("invalid session metadata")?;
                 let id = meta
                     .id
                     .or(meta.session_id)
                     .context("rollout metadata has no thread id")?;
-                agents.push(build_agent(&id, meta.cwd, "", modified, native)?);
+                if exact.is_some_and(|wanted| wanted != id) {
+                    return Ok(None);
+                }
+                build_agent(&id, meta.cwd, "", modified, native).map(Some)
+            })();
+            match result {
+                Ok(Some(agent)) => {
+                    if !report.push(agent) {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => report.warn(RUNTIME, failure_code, Some(&path), format!("{e:#}")),
             }
         }
-        agents.sort_by(|a, b| a.addr.cmp(&b.addr).then(b.last_seen.cmp(&a.last_seen)));
-        agents.dedup_by(|a, b| a.addr == b.addr);
-        Ok(agents)
+        report.agents.sort_by(|a, b| a.addr.cmp(&b.addr));
     }
 }
 
@@ -354,16 +420,6 @@ fn slugify(s: &str) -> String {
         .join("-")
 }
 
-fn mtime_millis(path: &PathBuf) -> Result<u64> {
-    let modified = fs::metadata(path)
-        .and_then(|m| m.modified())
-        .context("reading rollout modification time")?;
-    Ok(modified
-        .duration_since(UNIX_EPOCH)
-        .context("rollout modification time precedes epoch")?
-        .as_millis() as u64)
-}
-
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -376,21 +432,30 @@ impl Adapter for Codex {
         RUNTIME
     }
 
-    fn discover(&self) -> Result<Vec<Agent>> {
+    fn discover(&self) -> Result<Discovery> {
         if !self
             .codex_home
             .try_exists()
             .context("checking Codex directory")?
         {
-            return Ok(Vec::new());
+            return Ok(Discovery::default());
         }
         let cutoff = now_millis().saturating_sub(live_window_millis()?);
 
-        self.discover_since(cutoff)
+        self.discover_since(cutoff, None)
     }
 
-    fn discover_all(&self) -> Result<Vec<Agent>> {
-        self.discover_since(0)
+    fn discover_all(&self) -> Result<Discovery> {
+        self.discover_since(0, None)
+    }
+
+    fn find_exact(&self, address: &str) -> Result<Discovery> {
+        let address: crate::address::Address = address.parse()?;
+        let id = address
+            .as_str()
+            .strip_prefix("codex:")
+            .context("not a Codex address")?;
+        self.discover_since(0, Some(id))
     }
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
@@ -427,21 +492,23 @@ impl Adapter for Codex {
 }
 
 impl Codex {
-    fn discover_since(&self, cutoff: u64) -> Result<Vec<Agent>> {
-        if !self
-            .codex_home
-            .try_exists()
-            .context("checking Codex home")?
-        {
-            return Ok(Vec::new());
-        }
-        match self.discover_via_sqlite(cutoff) {
-            Ok(agents) => Ok(agents),
+    fn discover_since(&self, cutoff: u64, exact: Option<&str>) -> Result<Discovery> {
+        let mut report = Discovery::default();
+        let mut budget = Budget::new();
+        match self.discover_via_sqlite(cutoff, exact, &mut budget, &mut report) {
+            Ok(true) => {}
+            Ok(false) => self.discover_via_rollouts(cutoff, exact, &mut budget, &mut report),
             Err(e) => {
-                crate::debug(|| format!("codex: state db unreadable ({e}); using rollouts"));
-                self.discover_via_rollouts(cutoff)
+                report.warn(
+                    RUNTIME,
+                    Code::SourceUnavailable,
+                    Some(&self.codex_home),
+                    format!("state database unavailable; using rollouts: {e:#}"),
+                );
+                self.discover_via_rollouts(cutoff, exact, &mut budget, &mut report);
             }
         }
+        Ok(report)
     }
 }
 
@@ -500,6 +567,209 @@ fn queue_message(cli: &PathBuf, thread: &str, env: &Envelope) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn state_fixture(root: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,cwd TEXT,agent_nickname TEXT,updated_at_ms INTEGER,updated_at INTEGER,archived INTEGER);").unwrap();
+        conn
+    }
+    fn rollout(path: &std::path::Path, id: &str) {
+        fs::write(
+            path,
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":"/example"}})
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn capped_database_listing_does_not_hide_exact_addresses() {
+        let root = tempfile::tempdir().unwrap();
+        let mut conn = state_fixture(root.path());
+        let tx = conn.transaction().unwrap();
+        for i in 0..600 {
+            tx.execute(
+                "INSERT INTO threads VALUES(?1,'/example','',?2,0,0)",
+                rusqlite::params![format!("thread-{i}"), i],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        let mut report = adapter.discover_all().unwrap();
+        assert_eq!(report.agents.len(), MAX_AGENTS);
+        assert!(!report.complete);
+        assert!(!report.agents.iter().any(|a| a.addr == "codex:thread-0"));
+        let registry = crate::registry::Registry::new(vec![Box::new(adapter)]);
+        assert!(
+            registry.resolve(&mut report, "thread-599").is_err(),
+            "partial lists must not authorize name resolution"
+        );
+        assert_eq!(
+            registry
+                .resolve(&mut report, "codex:thread-0")
+                .unwrap()
+                .addr,
+            "codex:thread-0"
+        );
+    }
+
+    #[test]
+    fn capped_rollout_listing_has_a_separate_bounded_exact_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        for i in 0..600 {
+            rollout(
+                &sessions.join(format!("rollout-{i}.jsonl")),
+                &format!("r{i}"),
+            );
+        }
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        let report = adapter.discover_all().unwrap();
+        assert_eq!(report.agents.len(), MAX_AGENTS);
+        assert!(!report.complete);
+        let missing = (0..600)
+            .map(|i| format!("codex:r{i}"))
+            .find(|addr| !report.agents.iter().any(|a| a.addr == *addr))
+            .unwrap();
+        let exact = adapter.find_exact(&missing).unwrap();
+        assert!(exact.complete);
+        assert_eq!(exact.agents.len(), 1);
+        assert_eq!(exact.agents[0].addr, missing);
+    }
+
+    #[test]
+    fn total_rollout_metadata_bytes_are_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        for i in 0..12 {
+            fs::write(sessions.join(format!("rollout-{i}.jsonl")),serde_json::json!({
+                "type":"session_meta", "payload":{"id":format!("r{i}"),"padding":"x".repeat(1024*1024-1024)}
+            }).to_string()).unwrap();
+        }
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        let report = adapter.discover_all().unwrap();
+        assert!(!report.complete);
+        assert!(report.agents.len() <= 8);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| matches!(w.code, Code::LimitReached)));
+    }
+
+    #[test]
+    fn malformed_database_rows_keep_valid_rows_and_reach_mcp_as_structured_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = state_fixture(root.path());
+        conn.execute_batch(
+            "INSERT INTO threads VALUES('valid','/example','',3,0,0);
+            INSERT INTO threads VALUES('invalid id','/example','',2,0,0);
+            INSERT INTO threads VALUES('also-valid','/example','',1,0,0);",
+        )
+        .unwrap();
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        let report = adapter.discover_all().unwrap();
+        assert_eq!(report.agents.len(), 2);
+        let mcp = crate::mcp::discovery_json(None, &report);
+        assert_eq!(mcp["complete"], false);
+        assert_eq!(mcp["warnings"][0]["runtime"], "codex");
+        assert_eq!(mcp["warnings"][0]["code"], "invalid_record");
+        assert!(mcp["warnings"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("state_5.sqlite"));
+        assert!(report
+            .agents
+            .iter()
+            .all(|a| a.liveness == Liveness::Inferred));
+    }
+
+    #[test]
+    fn expensive_database_work_is_interrupted_instead_of_hanging_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(root.path().join("state_5.sqlite")).unwrap();
+        conn.execute_batch("CREATE VIEW threads AS WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000)
+            SELECT printf('t%d',x) AS id,'' AS cwd,'' AS agent_nickname,x AS updated_at_ms,0 AS updated_at,0 AS archived FROM n;").unwrap();
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        let start = std::time::Instant::now();
+        let report = adapter.discover_all().unwrap();
+        assert!(!report.complete);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| matches!(w.code, Code::LimitReached)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn concurrent_rollout_writes_and_disappearances_preserve_stable_records() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        rollout(&sessions.join("rollout-stable.jsonl"), "stable");
+        fs::write(sessions.join("rollout-malformed.jsonl"), "{partial").unwrap();
+        let moving = sessions.join("rollout-moving.jsonl");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready = barrier.clone();
+        let writer = std::thread::spawn(move || {
+            ready.wait();
+            for _ in 0..400 {
+                rollout(&moving, "moving");
+                fs::write(&moving, "{partial").unwrap();
+                fs::remove_file(&moving).unwrap();
+            }
+        });
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        barrier.wait();
+        for _ in 0..20 {
+            let report = adapter.discover_all().unwrap();
+            assert!(report.agents.iter().any(|a| a.addr == "codex:stable"));
+            assert!(!report.complete);
+            assert!(!report.warnings.is_empty());
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn inaccessible_rollout_directory_does_not_discard_readable_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        rollout(&sessions.join("rollout-stable.jsonl"), "stable");
+        let blocked = sessions.join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        rollout(&blocked.join("rollout-hidden.jsonl"), "hidden");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+        let adapter = Codex {
+            codex_home: root.path().to_owned(),
+        };
+        let result = adapter.discover_all();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = result.unwrap();
+        assert!(report.agents.iter().any(|a| a.addr == "codex:stable"));
+        // Root can read mode-000 directories; ordinary CI users cannot.
+        // SAFETY: geteuid has no arguments or caller-owned memory.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!report.complete);
+            assert!(report
+                .warnings
+                .iter()
+                .any(|w| matches!(w.code, Code::Unreadable)));
+        }
+    }
     #[test]
     fn special_files_cannot_block_discovery() {
         use std::os::unix::ffi::OsStrExt;
@@ -517,8 +787,9 @@ mod tests {
         let adapter = Codex {
             codex_home: temp.path().to_owned(),
         };
-        assert!(adapter.discover_via_sqlite(0).is_err());
-        assert!(adapter.discover_via_rollouts(0).unwrap().is_empty());
+        let report = adapter.discover_all().unwrap();
+        assert!(report.agents.is_empty());
+        assert!(!report.complete);
     }
     #[test]
     fn real_rollout_files_keep_thread_ids_distinct_from_session_roots() {
@@ -544,7 +815,7 @@ mod tests {
         let adapter = Codex {
             codex_home: temp.path().to_owned(),
         };
-        let agents = adapter.discover_via_rollouts(0).unwrap();
+        let agents = adapter.discover_all().unwrap().agents;
         assert_eq!(
             agents.iter().map(|a| a.addr.as_str()).collect::<Vec<_>>(),
             vec!["codex:child", "codex:older"]
@@ -560,12 +831,17 @@ mod tests {
         let adapter = Codex {
             codex_home: temp.path().to_owned(),
         };
-        assert!(adapter.discover_via_sqlite(2).unwrap().is_empty());
+        assert!(adapter.discover_since(2, None).unwrap().agents.is_empty());
         let registry = crate::registry::Registry::new(vec![Box::new(adapter)]);
         assert_eq!(
-            registry.resolve(&[], "codex:old").unwrap().addr,
+            registry
+                .resolve(&mut Discovery::default(), "codex:old")
+                .unwrap()
+                .addr,
             "codex:old"
         );
-        assert!(registry.resolve(&[], "codex:archived").is_err());
+        assert!(registry
+            .resolve(&mut Discovery::default(), "codex:archived")
+            .is_err());
     }
 }

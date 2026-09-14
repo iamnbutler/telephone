@@ -46,6 +46,7 @@ message in the local journal; exchanges stop after eight hops.
 
 `live` means the process and its start time were verified. `recent?` is only
 an inference; Codex threads use this label. `telephone list --all` includes
-quiet threads, which remain addressable by exact ID.
+quiet threads. Listings are capped; exact addresses use a separate lookup.
+If discovery is incomplete, Telephone reports it and refuses short-name routing.
 
 See `telephone --help` and [security and upgrade notes](SECURITY.md).

@@ -20,6 +20,7 @@
 
 mod adapters;
 mod address;
+mod discovery;
 mod envelope;
 mod identity;
 mod inbox;
@@ -175,10 +176,21 @@ fn run() -> Result<()> {
 fn cmd_list(json: bool, all: bool) -> Result<()> {
     let me = identity::whoami()?;
     let registry = default_registry()?;
-    let (agents, warnings) = registry.discover_with(all);
+    let discovery = registry.discover_with(all);
+    let agents = &discovery.agents;
+    let warnings = &discovery.warnings;
+    if !discovery.complete {
+        warn("discovery is incomplete; results are partial");
+    }
+    if discovery.warnings_omitted > 0 {
+        warn(format!(
+            "{} additional discovery warnings omitted",
+            discovery.warnings_omitted
+        ));
+    }
 
     if json {
-        for warning in &warnings {
+        for warning in warnings {
             warn(warning);
         }
         let out: Vec<serde_json::Value> = agents
@@ -214,7 +226,7 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
         .unwrap_or(0);
     let addr_width = agents.iter().map(|a| a.addr.len()).max().unwrap_or(0);
 
-    for a in &agents {
+    for a in agents {
         let is_me = Some(&a.addr) == me.addr.as_ref();
         let marker = if is_me { "*" } else { " " };
         let transport = a.transports.first().map(|t| t.label()).unwrap_or("none");
@@ -321,6 +333,19 @@ fn cmd_doctor() -> Result<()> {
     for adapter in &registry.adapters {
         match adapter.discover() {
             Ok(found) => {
+                for warning in &found.warnings {
+                    warn(warning);
+                }
+                if !found.complete {
+                    warn(format!("{} discovery is incomplete", adapter.runtime()));
+                }
+                if found.warnings_omitted > 0 {
+                    warn(format!(
+                        "{} additional discovery warnings omitted",
+                        found.warnings_omitted
+                    ));
+                }
+                let found = found.agents;
                 let native = found
                     .iter()
                     .filter(|a| {

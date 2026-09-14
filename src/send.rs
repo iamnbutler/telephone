@@ -19,8 +19,15 @@ pub fn send(to: &str, body: &str, kind: Kind, reply_to: Option<String>) -> Resul
         anyhow::bail!("a reply requires --reply-to");
     }
     let registry = crate::default_registry()?;
-    let (agents, warnings) = registry.discover();
-    let target = registry.resolve(&agents, to)?;
+    let mut discovery = registry.discover();
+    let target = registry.resolve(&mut discovery, to).with_context(|| {
+        format!(
+            "recipient lookup: discovery complete={}, warnings={} ({} omitted)",
+            discovery.complete,
+            serde_json::json!(discovery.warnings),
+            discovery.warnings_omitted
+        )
+    })?;
     let mut draft = Envelope::new(&from, &target.addr, kind, body.to_owned())?;
     draft.from_name = me.name;
     let adapter = registry
@@ -69,8 +76,14 @@ pub fn send(to: &str, body: &str, kind: Kind, reply_to: Option<String>) -> Resul
             "\nWARNING: outcome journal update failed: {e:#}; do not resend blindly."
         ));
     }
-    for warning in warnings {
+    for warning in discovery.warnings {
         report.push_str(&format!("\nwarning: {}", serde_json::json!(warning)));
+    }
+    if discovery.warnings_omitted > 0 {
+        report.push_str(&format!(
+            "\n{} additional discovery warnings omitted.",
+            discovery.warnings_omitted
+        ));
     }
     Ok(report)
 }
