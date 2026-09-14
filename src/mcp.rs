@@ -3,10 +3,15 @@ use crate::{envelope::Kind, identity, send, store::InboxBatch};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, Read, Write};
+use std::os::fd::AsFd;
+
+#[cfg(test)]
+mod integration;
+mod io;
+mod session;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
-const MAX_REQUEST: u64 = 1024 * 1024;
+const MAX_REQUEST: usize = 1024 * 1024;
 struct Reply {
     value: Value,
     receipt: Option<InboxBatch>,
@@ -73,114 +78,11 @@ fn empty_object() -> Value {
 }
 
 pub fn serve() -> Result<()> {
-    serve_io(std::io::stdin().lock(), std::io::stdout().lock())
-}
-fn serve_io(mut input: impl BufRead, mut output: impl Write) -> Result<()> {
-    let mut initialized = false;
-    let mut ready = false;
-    loop {
-        let mut line = String::new();
-        let size = input
-            .by_ref()
-            .take(MAX_REQUEST + 1)
-            .read_line(&mut line)
-            .context("reading MCP request")?;
-        if size == 0 {
-            return Ok(());
-        }
-        if size as u64 > MAX_REQUEST {
-            writeln!(
-                output,
-                "{}",
-                error(Value::Null, -32600, "request exceeds size limit")
-            )?;
-            output.flush()?;
-            anyhow::bail!("closing MCP stream after oversized request");
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                writeln!(output, "{}", error(Value::Null, -32700, "invalid JSON"))?;
-                output.flush()?;
-                continue;
-            }
-        };
-        let id = request.get("id").cloned();
-        let method = request.get("method").and_then(Value::as_str);
-        if !request.is_object()
-            || request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
-            || method.is_none()
-            || id
-                .as_ref()
-                .is_some_and(|v| !(v.is_string() || v.is_number()))
-        {
-            writeln!(
-                output,
-                "{}",
-                error(Value::Null, -32600, "invalid JSON-RPC request")
-            )?;
-            output.flush()?;
-            continue;
-        }
-        let method = method.context("validated method disappeared")?;
-        if id.is_none() {
-            if method == "notifications/initialized" && initialized {
-                ready = true;
-            }
-            // Unknown notifications and cancellation of completed calls have no response.
-            continue;
-        }
-        let id = id.context("validated request id disappeared")?;
-        let params = request.get("params").cloned().unwrap_or_else(empty_object);
-        let result = match method {
-            "initialize" if !initialized => {
-                if !params.is_object()
-                    || !params.get("protocolVersion").is_some_and(Value::is_string)
-                    || !params.get("capabilities").is_some_and(Value::is_object)
-                    || !params.get("clientInfo").is_some_and(Value::is_object)
-                {
-                    Err(RpcError::invalid("invalid initialize parameters"))
-                } else {
-                    initialized = true;
-                    Ok(Reply::value(
-                        json!({"protocolVersion":PROTOCOL_VERSION,"capabilities":{"tools":{}},
-                        "serverInfo":{"name":"telephone","version":env!("CARGO_PKG_VERSION")}}),
-                    ))
-                }
-            }
-            "ping" => args::<Empty>(params).map(|_| Reply::value(json!({}))),
-            "tools/list" if ready => {
-                args::<Empty>(params).map(|_| Reply::value(json!({"tools":tool_definitions()})))
-            }
-            "tools/call" if ready => call_tool(params),
-            "initialize" => Err(RpcError::invalid("already initialized")),
-            "tools/list" | "tools/call" => Err(RpcError {
-                code: -32600,
-                message: "initialize the MCP session first".into(),
-            }),
-            _ => Err(RpcError {
-                code: -32601,
-                message: "unknown method".into(),
-            }),
-        };
-        let (response, receipt) = match result {
-            Ok(reply) => (
-                json!({"jsonrpc":"2.0","id":id,"result":reply.value}),
-                reply.receipt,
-            ),
-            Err(e) => (error(id, e.code, &e.message), None),
-        };
-        // A pending InboxBatch owns an uncommitted transaction. On any output
-        // error it drops and rolls back, instead of losing unread messages.
-        writeln!(output, "{response}").context("writing MCP response")?;
-        output.flush().context("flushing MCP response")?;
-        if let Some(receipt) = receipt {
-            receipt.acknowledge()?;
-        }
-    }
+    session::serve(
+        std::io::stdin().as_fd(),
+        std::io::stdout().as_fd(),
+        crate::inbox::root()?,
+    )
 }
 fn error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
@@ -196,7 +98,7 @@ fn operational(result: Result<Reply>) -> std::result::Result<Reply, RpcError> {
         ),
     })
 }
-fn call_tool(params: Value) -> std::result::Result<Reply, RpcError> {
+fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result<Reply, RpcError> {
     let call: ToolCall = args(params)?;
     match call.name.as_str() {
         "list_agents" => {
@@ -231,7 +133,8 @@ fn call_tool(params: Value) -> std::result::Result<Reply, RpcError> {
                 let addr = identity::whoami()?
                     .addr
                     .context("cannot identify agent; set TELEPHONE_ADDR")?;
-                let batch = crate::inbox::read(&addr, args.peek)?;
+                let batch =
+                    crate::store::Store::open(inbox_root)?.inbox(&addr.parse()?, args.peek)?;
                 let messages: Vec<_> = batch
                     .messages
                     .iter()
@@ -280,6 +183,33 @@ fn tool_definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::Shutdown,
+        os::unix::net::UnixStream,
+    };
+
+    fn transcript(bytes: Vec<u8>) -> (Result<()>, Vec<Value>) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let root = tempfile::tempdir().unwrap();
+            session::serve(server.as_fd(), server.as_fd(), root.path().to_owned())
+        });
+        let mut writer = client.try_clone().unwrap();
+        let sending = std::thread::spawn(move || {
+            writer.write_all(&bytes).unwrap();
+            writer.shutdown(Shutdown::Write).unwrap();
+        });
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        sending.join().unwrap();
+        let result = worker.join().unwrap();
+        let replies = output
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        (result, replies)
+    }
     #[test]
     fn real_protocol_transcript_handles_ping_errors_and_recovers_after_bad_json() {
         let transcript = concat!(
@@ -288,32 +218,33 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}\n",
-            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"check_inbox\",\"arguments\":{\"peek\":\"true\"}}}\n",
-            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"to\":\"a:1\",\"body\":\"x\",\"kind\":\"oops\"}}}\n"
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"check_inbox\",\"arguments\":{\"peek\":\"true\"}}}\n"
         );
-        let mut output = Vec::new();
-        serve_io(std::io::Cursor::new(transcript), &mut output).unwrap();
-        let replies: Vec<Value> = String::from_utf8(output)
-            .unwrap()
-            .lines()
-            .map(|s| serde_json::from_str(s).unwrap())
-            .collect();
-        assert_eq!(replies.len(), 6);
+        let (result, replies) = self::transcript(transcript.as_bytes().to_vec());
+        result.unwrap();
+        assert_eq!(replies.len(), 5);
         assert_eq!(replies[0]["error"]["code"], -32700);
         assert_eq!(replies[2]["result"], json!({}));
         assert_eq!(replies[3]["result"]["tools"].as_array().unwrap().len(), 3);
         assert_eq!(replies[4]["error"]["code"], -32602);
-        assert_eq!(replies[5]["error"]["code"], -32602);
     }
     #[test]
     fn oversized_request_is_rejected_before_parsing() {
-        let mut output = Vec::new();
-        assert!(serve_io(
-            std::io::Cursor::new(vec![b' '; MAX_REQUEST as usize + 2]),
-            &mut output
-        )
-        .is_err());
-        let value: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(value["error"]["code"], -32600);
+        let (result, replies) = transcript(vec![b' '; MAX_REQUEST]);
+        assert!(result.is_err());
+        assert_eq!(replies[0]["error"]["code"], -32600);
+    }
+    #[test]
+    fn invalid_send_kind_is_rejected_before_any_adapter_or_journal_work() {
+        let root = tempfile::tempdir().unwrap();
+        let result = call_tool(
+            json!({"name":"send_message","arguments":{"to":"test:receiver","body":"x","kind":"oops"}}),
+            root.path(),
+        );
+        let Err(error) = result else {
+            panic!("invalid kind was accepted");
+        };
+        assert_eq!(error.code, -32602);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }

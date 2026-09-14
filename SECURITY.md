@@ -45,8 +45,23 @@ cooperative reply loops, not hostile senders starting fresh conversations.
 
 Current limits: 64 KiB per message body, 1 MiB per MCP request, 100 messages per
 inbox read, and 1,000 unread messages per recipient. Subprocess output is capped
-at 64 KiB per stream. Native operations have deadlines; storage growth and
-stalled stdio still need stronger bounds.
+at 64 KiB per stream. Native operations have deadlines; storage growth still
+needs stronger bounds.
+
+MCP stdin/stdout must be pipes or sockets. Partial input frames and queued output
+have five-second deadlines, including slow trickle traffic; idle sessions do not
+expire. Output is capped at 32 queued frames and 64 MiB. A stalled or broken stream
+closes and rolls back uncommitted inbox reads. Only one tool call is admitted at
+a time; additional calls receive a busy error without being started. Ping and
+cancellation are handled independently of tool execution.
+
+Cancellation drops unsent replies and rolls back pending inbox receipts. If a
+response has already started writing, its frame must finish or the stream closes;
+it cannot be interleaved with another response. Cancellation cannot recall a send
+or make retrying it safe. An admitted operation finishes under its existing
+deadlines so subprocess cleanup and send bookkeeping are not abandoned. Shutdown
+joins that worker: blocked filesystem calls and diagnostic output still need a
+hard shutdown bound. The five-second frame deadlines are not tool deadlines.
 
 Discovery scans at most 4,096 directory entries, reads up to 8 MiB of metadata,
 and returns at most 256 agents per runtime. SQLite queries also have row-size,
@@ -81,7 +96,7 @@ identity variables require an explicit `TELEPHONE_ADDR`.
 - [Retention, global quotas, rate limits and journal inspection](https://github.com/iamnbutler/telephone/issues/3)
 - [Registration for other MCP runtimes](https://github.com/iamnbutler/telephone/issues/4)
 - [Opt-in compatibility tests against real Claude/Codex releases](https://github.com/iamnbutler/telephone/issues/5)
-- [Bounded stdio and responsive MCP cancellation](https://github.com/iamnbutler/telephone/issues/7)
+- [Hard-bounded worker shutdown and diagnostic output](https://github.com/iamnbutler/telephone/issues/11)
 
 External messaging must remain disabled until the authentication and authorization
 boundary is implemented. These local safeguards do not make it network-ready.
