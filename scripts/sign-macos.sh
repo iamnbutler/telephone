@@ -21,6 +21,7 @@ esac
 [[ -n ${MACOS_CERTIFICATE_PASSWORD:-} ]] || fail 'MACOS_CERTIFICATE_PASSWORD is required.'
 [[ ${MACOS_SIGNING_IDENTITY:-} =~ ^[A-F0-9]{40}$ ]] || fail 'MACOS_SIGNING_IDENTITY must be a certificate SHA-1 fingerprint.'
 [[ ${MACOS_TEAM_ID:-} =~ ^[A-Z0-9]{10}$ ]] || fail 'MACOS_TEAM_ID must be a ten-character Apple team ID.'
+script_dir=$(cd "$(dirname "$0")" && pwd)
 
 # Reject extra paths, duplicate entries and traversal before extracting anything.
 listing=$(tar -tzf "$input")
@@ -62,21 +63,27 @@ if [[ ${GITHUB_ACTIONS:-} == true ]]; then
   printf '::add-mask::%s\n' "$keychain_password"
 fi
 printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$work/certificate.p12"
-security create-keychain -p "$keychain_password" "$keychain"
-security set-keychain-settings -lut 600 "$keychain"
-security unlock-keychain -p "$keychain_password" "$keychain"
+security create-keychain -p "$keychain_password" "$keychain" || fail 'Could not create the temporary keychain.'
+security set-keychain-settings -lut 600 "$keychain" || fail 'Could not configure the temporary keychain.'
+security unlock-keychain -p "$keychain_password" "$keychain" || fail 'Could not unlock the temporary keychain.'
 # Restrict this imported key to codesign; never grant every application access (-A).
 security import "$work/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
-  -f pkcs12 -T /usr/bin/codesign
+  -f pkcs12 -T /usr/bin/codesign || fail 'Could not import the signing identity.'
 rm "$work/certificate.p12"
 unset MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD
-security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+# codesign still consults the search list even with --keychain. Deleting this
+# temporary keychain removes its entry; other entries are left untouched.
+python3 "$script_dir/add-signing-keychain.py" "$keychain" || fail 'Could not register the temporary keychain.'
+security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null \
+  || fail 'Could not configure signing-key access.'
 unset keychain_password
-identities=$(security find-identity -v -p codesigning "$keychain" | awk '$1 ~ /^[0-9]+\)$/ { print $2 }')
+identities=$(security find-identity -v -p codesigning "$keychain" | awk '$1 ~ /^[0-9]+\)$/ { print $2 }') \
+  || fail 'Could not query the imported signing identity.'
 [[ "$identities" == "$MACOS_SIGNING_IDENTITY" ]] || fail 'Expected only the pinned, valid signing identity.'
 
 codesign --force --sign "$MACOS_SIGNING_IDENTITY" --keychain "$keychain" \
-  --identifier com.github.iamnbutler.telephone --options runtime --timestamp "$binary"
+  --identifier com.github.iamnbutler.telephone --options runtime --timestamp "$binary" \
+  || fail 'Developer ID signing failed.'
 # Require Apple's Developer ID Application certificate extension and our team,
 # not just a cryptographically valid signature (which could still be ad-hoc).
 requirement="anchor apple generic and certificate leaf[subject.OU] = \"$MACOS_TEAM_ID\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"

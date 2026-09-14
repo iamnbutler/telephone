@@ -5,6 +5,7 @@ umask 077
 
 [[ $(uname -s) == Darwin ]] || { printf 'These tests require macOS.\n' >&2; exit 1; }
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
+python3 "$repo_root/scripts/test_signing_keychain.py"
 work=$(mktemp -d "${TMPDIR:-/tmp}/telephone-sign-test.XXXXXX")
 cleanup() {
   status=$?
@@ -73,6 +74,17 @@ expect_failure 'malformed base64' 'base64:' \
 # This creates a real temporary keychain, then fails to import an invalid PKCS#12.
 # Assert that the EXIT trap deletes it and restores the original search list.
 expect_failure 'invalid PKCS#12 and keychain cleanup' 'SecKeychainItemImport' \
+  "${sign[@]}" "$target" "$archive" "$work/output.tar.gz"
+# Import a real, disposable identity. It must get through Keychain setup, then
+# fail the pinned-identity check. Do not trust this self-signed certificate.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj '/CN=Telephone temporary test identity' -addext extendedKeyUsage=codeSigning \
+  -keyout "$work/test-key.pem" -out "$work/test-cert.pem" > "$work/openssl.log" 2>&1
+openssl pkcs12 -export -in "$work/test-cert.pem" -inkey "$work/test-key.pem" \
+  -out "$work/test.p12" -passout env:MACOS_CERTIFICATE_PASSWORD \
+  -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+expect_failure 'real PKCS#12 and search-list cleanup' 'Expected only the pinned, valid signing identity' \
+  env MACOS_CERTIFICATE_P12_BASE64="$(base64 < "$work/test.p12")" \
   "${sign[@]}" "$target" "$archive" "$work/output.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$work/duplicate.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE telephone
 expect_failure 'duplicate archive member' 'Unexpected archive contents' \
