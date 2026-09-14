@@ -70,10 +70,46 @@ adapter instead.
 
 ## Install
 
+Download a prebuilt archive from the [latest release](https://github.com/iamnbutler/telephone/releases/latest):
+
+| System | Download |
+| --- | --- |
+| macOS 11+, Apple Silicon | [ARM64](https://github.com/iamnbutler/telephone/releases/latest/download/telephone-aarch64-apple-darwin.tar.gz) |
+| macOS 11+, Intel | [x86-64](https://github.com/iamnbutler/telephone/releases/latest/download/telephone-x86_64-apple-darwin.tar.gz) |
+| Linux | [x86-64](https://github.com/iamnbutler/telephone/releases/latest/download/telephone-x86_64-unknown-linux-musl.tar.gz) · [ARM64](https://github.com/iamnbutler/telephone/releases/latest/download/telephone-aarch64-unknown-linux-musl.tar.gz) |
+
+No Rust installation is needed. Compare the archive's SHA-256 hash with its
+entry in [SHA256SUMS](https://github.com/iamnbutler/telephone/releases/latest/download/SHA256SUMS)
+before extracting it (`shasum -a 256 <archive>` on macOS, `sha256sum <archive>`
+on Linux).
+
+For example, after downloading the Apple Silicon archive:
+
 ```sh
-cargo build --release
-telephone install    # prints the config each runtime needs
+telephone_unpack=$(mktemp -d)
+tar -xzf telephone-aarch64-apple-darwin.tar.gz -C "$telephone_unpack"
+mkdir -p "$HOME/.local/bin"
+install -m 755 "$telephone_unpack/telephone" "$HOME/.local/bin/telephone"
+export PATH="$HOME/.local/bin:$PATH"
+telephone install
 ```
+
+Use the matching archive name for your platform. Keep `~/.local/bin` on your
+PATH in future shells. `telephone install` prints the setup instructions for
+your runtimes; it does not change their configuration.
+
+Linux binaries are statically linked. macOS binaries are ad-hoc signed, not
+Developer ID signed or notarized, so macOS may require explicit approval.
+Windows is not currently supported.
+
+To build from source instead, install [Rust](https://rustup.rs/) and run:
+
+```sh
+cargo install --locked --path .
+telephone install
+```
+
+Maintainers: see [RELEASING.md](RELEASING.md) for the release script and build pipeline.
 
 ## Use
 
