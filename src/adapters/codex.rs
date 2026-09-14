@@ -23,7 +23,8 @@
 
 use crate::envelope::Envelope;
 use crate::inbox;
-use crate::registry::{Adapter, Agent, Delivered, Status, Transport};
+use crate::adapters::codex_appserver::{self, ThreadStatus};
+use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
@@ -204,7 +205,11 @@ fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Ag
         runtime: RUNTIME,
         name,
         cwd: cwd.map(PathBuf::from),
+        // Recency alone can't distinguish a running thread from one that
+        // exited just after its last write. `enrich_with_runtime_status`
+        // upgrades this when the owning daemon can be reached.
         status: Status::Unknown,
+        liveness: Liveness::Inferred,
         last_seen,
         transports: if codex_cli().is_some() {
             vec![Transport::CodexQueue, Transport::Inbox]
@@ -256,15 +261,18 @@ impl Adapter for Codex {
         }
         let cutoff = now_millis().saturating_sub(live_window_millis());
 
-        // The state database is authoritative; rollouts are the safety net.
-        match self.discover_via_sqlite(cutoff) {
-            Ok(agents) if !agents.is_empty() => Ok(agents),
-            Ok(_) => self.discover_via_rollouts(cutoff),
+        // The state database is authoritative for *which* threads exist;
+        // rollouts are the safety net.
+        let mut agents = match self.discover_via_sqlite(cutoff) {
+            Ok(agents) if !agents.is_empty() => agents,
+            Ok(_) => self.discover_via_rollouts(cutoff)?,
             Err(e) => {
                 crate::debug(|| format!("codex: state db unreadable ({e}); using rollouts"));
-                self.discover_via_rollouts(cutoff)
+                self.discover_via_rollouts(cutoff)?
             }
-        }
+        };
+        enrich_with_runtime_status(&mut agents);
+        Ok(agents)
     }
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
@@ -331,4 +339,62 @@ fn queue_message(cli: &PathBuf, thread: &str, env: &Envelope) -> Result<()> {
         anyhow::bail!("codex queue failed: {}", err.trim());
     }
     Ok(())
+}
+
+/// Replaces inferred liveness with real runtime status where a daemon can
+/// tell us, leaving the rest untouched.
+///
+/// Only worth the process spawn when there's a chance of a conclusive answer,
+/// so this is skipped entirely unless a managed app-server daemon is running.
+/// Without one, every thread comes back `notLoaded` and we'd have paid for
+/// nothing.
+fn enrich_with_runtime_status(agents: &mut [Agent]) {
+    if agents.is_empty() {
+        return;
+    }
+    if !managed_daemon_running() {
+        crate::debug(|| {
+            "codex: no managed app-server daemon; liveness stays inferred".to_string()
+        });
+        return;
+    }
+    let Some(cli) = codex_cli() else {
+        crate::debug(|| "codex: CLI not found; liveness stays inferred".to_string());
+        return;
+    };
+
+    let statuses = codex_appserver::thread_statuses(&cli);
+    crate::debug(|| format!("codex: app-server reported {} thread status(es)", statuses.len()));
+    if statuses.is_empty() {
+        return;
+    }
+    for agent in agents.iter_mut() {
+        let Some(id) = agent.addr.split_once(':').map(|(_, id)| id) else { continue };
+        let Some(status) = statuses.get(id) else { continue };
+        if !status.is_conclusive() {
+            continue;
+        }
+        agent.status = match status {
+            ThreadStatus::Active => Status::Busy,
+            _ => Status::Idle,
+        };
+        agent.liveness = Liveness::Verified;
+    }
+}
+
+/// Whether a managed app-server daemon is running.
+///
+/// Its control socket is the cheap signal; checking for the file costs nothing
+/// next to spawning an app-server to ask.
+fn managed_daemon_running() -> bool {
+    let home = match std::env::var("CODEX_HOME") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => match dirs::home_dir() {
+            Some(h) => h.join(".codex"),
+            None => return false,
+        },
+    };
+    home.join("app-server-control")
+        .join("app-server-control.sock")
+        .exists()
 }

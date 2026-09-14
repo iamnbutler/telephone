@@ -26,6 +26,34 @@ impl Status {
     }
 }
 
+/// How much we actually know about whether an agent is still running.
+///
+/// This is a first-class field rather than a footnote because the two cases
+/// are genuinely different and were previously presented identically. A
+/// registry that says "here are your agents" while quietly mixing live
+/// sessions with ones that exited minutes ago is worse than one that admits
+/// which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// We asked something authoritative and it said this session is running:
+    /// a live pid whose start time matches, or a runtime status from the
+    /// daemon that owns the session.
+    Verified,
+    /// Nobody can currently tell us. The session was active recently, which
+    /// is not the same as being active now -- it may have exited seconds after
+    /// its last write.
+    Inferred,
+}
+
+impl Liveness {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Liveness::Verified => "live",
+            Liveness::Inferred => "recent?",
+        }
+    }
+}
+
 /// How to actually reach an agent, most faithful first.
 #[derive(Debug, Clone)]
 pub enum Transport {
@@ -65,6 +93,8 @@ pub struct Agent {
     pub name: String,
     pub cwd: Option<PathBuf>,
     pub status: Status,
+    /// Whether [`Agent::status`] is something we confirmed or merely inferred.
+    pub liveness: Liveness,
     /// Epoch millis of the last activity the runtime reported.
     pub last_seen: u64,
     /// Ordered best-first. Delivery walks this and takes the first that works.
@@ -164,6 +194,7 @@ mod tests {
             name: name.into(),
             cwd: None,
             status: Status::Idle,
+            liveness: Liveness::Verified,
             last_seen: 0,
             transports: vec![Transport::Inbox],
         }

@@ -139,6 +139,7 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
                     "name": a.name,
                     "runtime": a.runtime,
                     "status": a.status.as_str(),
+                    "liveness": a.liveness.as_str(),
                     "cwd": a.cwd.as_ref().map(|c| c.display().to_string()),
                     "transport": a.transports.first().map(|t| t.label()),
                     "self": Some(&a.addr) == me.addr.as_ref(),
@@ -152,6 +153,13 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
     if agents.is_empty() {
         println!("No agents found.");
     }
+
+    // Size the columns to what's actually present: Codex addresses are a
+    // runtime prefix plus a uuid, and a fixed width either truncates them or
+    // wastes half the terminal when no Codex threads are around.
+    let name_width = agents.iter().map(|a| a.name.len()).max().unwrap_or(0);
+    let addr_width = agents.iter().map(|a| a.addr.len()).max().unwrap_or(0);
+
     for a in &agents {
         let is_me = Some(&a.addr) == me.addr.as_ref();
         let marker = if is_me { "*" } else { " " };
@@ -162,16 +170,29 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
             .map(|c| c.display().to_string())
             .unwrap_or_default();
         println!(
-            "{marker} {:<16} {:<28} {:<8} {:<6} {}",
+            "{marker} {:<name_width$}  {:<addr_width$}  {:<7}  {:<7}  {:<5}  {}",
             a.name,
             a.addr,
             a.status.as_str(),
+            a.liveness.as_str(),
             transport,
             cwd
         );
     }
+
+    let inferred = agents
+        .iter()
+        .any(|a| a.liveness == registry::Liveness::Inferred);
+    if me.addr.is_some() || inferred {
+        println!();
+    }
     if me.addr.is_some() {
-        println!("\n* = you");
+        println!("* = you");
+    }
+    if inferred {
+        println!(
+            "recent? = was active recently, but nothing could confirm it is still running"
+        );
     }
     for w in warnings {
         eprintln!("warning: {w}");
@@ -237,6 +258,7 @@ fn cmd_doctor() -> Result<()> {
 
     let registry = default_registry()?;
     println!("\nadapters:");
+    let mut any_inferred = false;
     for adapter in &registry.adapters {
         match adapter.discover() {
             Ok(found) => {
@@ -246,14 +268,33 @@ fn cmd_doctor() -> Result<()> {
                         !matches!(a.transports.first(), None | Some(registry::Transport::Inbox))
                     })
                     .count();
+                let confirmed = found
+                    .iter()
+                    .filter(|a| a.liveness == registry::Liveness::Verified)
+                    .count();
+                if confirmed < found.len() {
+                    any_inferred = true;
+                }
                 println!(
-                    "  {:<8} ok       {} agent(s), {native} reachable natively",
+                    "  {:<8} ok       {} agent(s), {native} reachable natively, \
+                     {confirmed} confirmed live",
                     adapter.runtime(),
                     found.len()
                 );
             }
             Err(e) => println!("  {:<8} error    {e}", adapter.runtime()),
         }
+    }
+
+    if any_inferred {
+        // Explain the gap rather than leaving "recent?" to be guessed at.
+        println!(
+            "\nsome agents could not be confirmed live.\n  \
+             Claude Code sessions are confirmed by pid and process start time.\n  \
+             Codex threads are confirmed only when the daemon that owns them can\n  \
+             be reached; otherwise the signal is recency, which cannot tell a\n  \
+             running thread from one that exited just after its last write."
+        );
     }
 
     if let Some(addr) = &me.addr {

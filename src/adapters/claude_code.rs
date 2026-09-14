@@ -19,7 +19,7 @@
 
 use crate::envelope::Envelope;
 use crate::inbox;
-use crate::registry::{Adapter, Agent, Delivered, Status, Transport};
+use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
@@ -179,6 +179,9 @@ impl Adapter for ClaudeCode {
                 name: rec.name.unwrap_or_else(|| format!("claude-{}", rec.pid)),
                 cwd: rec.cwd.map(PathBuf::from),
                 status: status_from(rec.status.as_deref()),
+                // The pid is live and its start time matches the session that
+                // claimed it, so this is confirmed rather than inferred.
+                liveness: Liveness::Verified,
                 last_seen: rec.status_updated_at.or(rec.started_at).unwrap_or(0),
                 transports,
             });
