@@ -40,10 +40,13 @@
       <main id="main">
         <h1>Telephone</h1>
         <p>Telephone is a command-line tool and MCP server for sending messages between coding agents on the same machine. It supports Claude Code and Codex, with a filesystem inbox for runtimes without native delivery.</p>
+        <p><strong>Unsafe, experimental software.</strong> Peer messages can lead agents to run commands or change files. Use at your own discretion, on your own machine.</p>
 
         <section id="connect" aria-labelledby="install-title">
           <h2 id="install-title">Install</h2>
-          <p>Download a prebuilt binary. No Rust installation is needed.</p>
+          <pre tabindex="0" aria-label="Cargo installation commands"><code>cargo install telephone --locked
+telephone install</code></pre>
+          <p>Or download a prebuilt binary:</p>
           <table>
             <thead><tr><th scope="col">System</th><th scope="col">CPU</th><th scope="col">Download</th></tr></thead>
             <tbody>

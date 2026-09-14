@@ -2,9 +2,11 @@
 name = "telephone"
 version = "0.1.0"
 edition = "2021"
-description = "Agent-agnostic communication layer for coding agents"
+description = "CLI and MCP server for messaging between local coding agents"
 license = "MIT"
 repository = "https://github.com/iamnbutler/telephone"
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1"

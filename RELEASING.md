@@ -28,6 +28,17 @@ have stable filenames so `/releases/latest/download/<filename>` links keep
 working. Every release includes `SHA256SUMS`, and every archive includes the
 binary, README, and MIT license.
 
+## crates.io
+
+From a clean checkout of the release commit, with `CARGO_REGISTRY_TOKEN` set:
+
+```sh
+cargo publish --locked --registry crates-io --dry-run
+cargo publish --locked --registry crates-io
+```
+
+The GitHub workflow publishes binary archives; crates.io publication is manual.
+
 ## Targets
 
 | Runner | Rust target |
