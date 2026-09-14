@@ -11,7 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
+  # A manual notarization check need not queue behind the ordinary main build.
+  group: build-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 defaults:
