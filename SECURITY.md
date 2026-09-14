@@ -45,8 +45,21 @@ cooperative reply loops, not hostile senders starting fresh conversations.
 
 Current limits: 64 KiB per message body, 1 MiB per MCP request, 100 messages per
 inbox read, and 1,000 unread messages per recipient. Subprocess output is capped
-at 64 KiB per stream. Native operations have deadlines; storage growth, total
-discovery time and stalled stdio still need stronger bounds.
+at 64 KiB per stream. Native operations have deadlines; storage growth and
+stalled stdio still need stronger bounds.
+
+Discovery scans at most 4,096 directory entries, reads up to 8 MiB of metadata,
+and returns at most 256 agents per runtime. SQLite queries also have row-size,
+VM-work and elapsed-time limits. The two-second scan budget is checked between
+filesystem operations; it cannot interrupt a stuck filesystem syscall. Process
+verification has a separate two-second subprocess deadline.
+
+MCP `list_agents` returns `complete`, structured `warnings` (runtime, code, path,
+message), and `warnings_omitted`. Warnings are capped at 64. The CLI reports these
+diagnostics on stderr, including with `--json`. Incomplete discovery refuses
+short-name routing; use an exact address. Exact Claude PIDs are read directly and
+Codex IDs get their own database lookup. Rollout-only lookup remains scan-bounded
+and reports uncertainty rather than declaring an unscanned address absent.
 
 ## Upgrading from the file inbox
 
@@ -68,7 +81,6 @@ identity variables require an explicit `TELEPHONE_ADDR`.
 - [Retention, global quotas, rate limits and journal inspection](https://github.com/iamnbutler/telephone/issues/3)
 - [Registration for other MCP runtimes](https://github.com/iamnbutler/telephone/issues/4)
 - [Opt-in compatibility tests against real Claude/Codex releases](https://github.com/iamnbutler/telephone/issues/5)
-- [Structured discovery warnings and bounded scans](https://github.com/iamnbutler/telephone/issues/6)
 - [Bounded stdio and responsive MCP cancellation](https://github.com/iamnbutler/telephone/issues/7)
 
 External messaging must remain disabled until the authentication and authorization

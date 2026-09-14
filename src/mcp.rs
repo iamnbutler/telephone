@@ -203,15 +203,11 @@ fn call_tool(params: Value) -> std::result::Result<Reply, RpcError> {
             let args: ListArgs = args(call.arguments)?;
             operational((|| {
                 let me = identity::whoami()?;
-                let (agents, warnings) = crate::default_registry()?.discover_with(args.all);
-                let listed: Vec<_> = agents.iter().filter(|a| Some(&a.addr) != me.addr.as_ref()).map(|a| json!({
-                    "address":a.addr,"name":a.name,"runtime":a.runtime,"status":a.status.as_str(),
-                    "liveness":a.liveness.as_str(),"cwd":a.cwd.as_ref().map(|c| c.display().to_string()),
-                    "transport":a.transports.first().map(|t|t.label())
-                })).collect();
-                Ok(text_result(serde_json::to_string_pretty(
-                    &json!({"you":me.addr,"agents":listed,"warnings":warnings}),
-                )?))
+                let report = crate::default_registry()?.discover_with(args.all);
+                Ok(text_result(serde_json::to_string_pretty(&discovery_json(
+                    me.addr.as_deref(),
+                    &report,
+                ))?))
             })())
         }
         "send_message" => {
@@ -252,9 +248,25 @@ fn call_tool(params: Value) -> std::result::Result<Reply, RpcError> {
         _ => Err(RpcError::invalid("unknown tool")),
     }
 }
+pub(crate) fn discovery_json(me: Option<&str>, report: &crate::discovery::Discovery) -> Value {
+    let listed: Vec<_> = report
+        .agents
+        .iter()
+        .filter(|a| Some(a.addr.as_str()) != me)
+        .map(|a| {
+            json!({
+                "address":a.addr,"name":a.name,"runtime":a.runtime,"status":a.status.as_str(),
+                "liveness":a.liveness.as_str(),"cwd":a.cwd.as_ref().map(|c|c.display().to_string()),
+                "transport":a.transports.first().map(|t|t.label())
+            })
+        })
+        .collect();
+    json!({"you":me,"agents":listed,"complete":report.complete,"warnings":report.warnings,"warnings_omitted":report.warnings_omitted})
+}
+
 fn tool_definitions() -> Value {
     json!([
-        {"name":"list_agents","description":"List local Claude Code and Codex sessions. Liveness distinguishes verified processes from inferred recency.",
+        {"name":"list_agents","description":"List local Claude Code and Codex sessions (up to 256 per runtime). Check complete and structured warnings: partial results cannot establish unique names. Exact addresses have a separate lookup. Liveness distinguishes verified processes from inferred recency.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"all":{"type":"boolean","description":"Include quiet Codex threads."}}}},
         {"name":"send_message","description":"Send untrusted peer text. Outcomes distinguish queue acceptance, unconfirmed socket writes, and an inbox requiring polling. Never retry an uncertain send blindly.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{

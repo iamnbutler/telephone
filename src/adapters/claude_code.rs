@@ -17,6 +17,7 @@
 //! Because this is undocumented it can break on any Claude Code release. The
 //! adapter falls back before sending, but never retries a possibly partial send.
 
+use crate::discovery::{self, Budget, Code, Discovery};
 use crate::envelope::Envelope;
 use crate::inbox;
 use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
@@ -108,6 +109,131 @@ impl ClaudeCode {
         .then(|| format!("{RUNTIME}:{pid}")))
     }
 
+    fn discover_paths(&self, exact: Option<u32>) -> Result<Discovery> {
+        let mut report = Discovery::default();
+        let mut budget = Budget::new();
+        let paths = if let Some(pid) = exact {
+            let path = self.sessions_dir.join(format!("{pid}.json"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => vec![path],
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => {
+                    report.warn(RUNTIME, Code::Unreadable, Some(&path), e);
+                    Vec::new()
+                }
+            }
+        } else {
+            discovery::files(
+                &self.sessions_dir,
+                false,
+                |p| p.extension().is_some_and(|e| e == "json"),
+                RUNTIME,
+                &mut budget,
+                &mut report,
+            )
+        };
+        let mut records = Vec::new();
+        for path in paths {
+            if !budget.check(RUNTIME, &mut report) {
+                break;
+            }
+            let cap = budget.bytes.min(64 * 1024);
+            let raw = match crate::private_fs::read_owned(&path, cap) {
+                Ok(raw) => {
+                    budget.bytes = budget.bytes.saturating_sub(raw.len());
+                    raw
+                }
+                Err(e) => {
+                    // An unsuccessful read may still have read up to its cap.
+                    budget.bytes = budget.bytes.saturating_sub(cap);
+                    report.warn(RUNTIME, Code::Unreadable, Some(&path), format!("{e:#}"));
+                    continue;
+                }
+            };
+            let rec = match serde_json::from_str::<SessionRecord>(&raw) {
+                Ok(rec) => rec,
+                Err(e) => {
+                    report.warn(RUNTIME, Code::InvalidRecord, Some(&path), e);
+                    continue;
+                }
+            };
+            if exact.is_some_and(|pid| pid != rec.pid) {
+                report.warn(
+                    RUNTIME,
+                    Code::InvalidRecord,
+                    Some(&path),
+                    "session record does not match requested PID",
+                );
+                continue;
+            }
+            if crate::proc::is_alive(rec.pid) {
+                records.push((path, rec));
+            }
+        }
+
+        let pids: Vec<_> = records.iter().map(|(_, rec)| rec.pid).collect();
+        let started = crate::proc::start_times(&pids);
+        for (path, rec) in records {
+            // Preserve already-read records; skip optional endpoint probing
+            // when enrichment has used up the remaining budget.
+            let enrich = budget.check(RUNTIME, &mut report);
+            if !crate::proc::start_time_matches(rec.started_at, started.get(&rec.pid)) {
+                continue;
+            }
+            let mut transports = Vec::new();
+            if let Some(socket) = rec
+                .messaging_socket_path
+                .as_ref()
+                .filter(|_| enrich)
+                .map(PathBuf::from)
+            {
+                match socket.try_exists() {
+                    Ok(true) => match self.token_for(rec.pid, &socket) {
+                        Ok(token) => transports.push(Transport::ClaudeUds {
+                            socket,
+                            session_id: rec.session_id.clone(),
+                            token: Some(token),
+                        }),
+                        Err(e) => report.note(
+                            RUNTIME,
+                            Code::NativeUnavailable,
+                            Some(&path),
+                            format!("native authentication unavailable: {e:#}"),
+                        ),
+                    },
+                    Ok(false) => report.note(
+                        RUNTIME,
+                        Code::NativeUnavailable,
+                        Some(&socket),
+                        "native socket is absent",
+                    ),
+                    Err(e) => report.note(RUNTIME, Code::NativeUnavailable, Some(&socket), e),
+                }
+            }
+            transports.push(Transport::Inbox);
+            let agent = Agent {
+                addr: format!("{RUNTIME}:{}", rec.pid),
+                runtime: RUNTIME,
+                name: rec.name.unwrap_or_else(|| format!("claude-{}", rec.pid)),
+                cwd: rec.cwd.map(PathBuf::from),
+                status: status_from(rec.status.as_deref()),
+                liveness: if crate::proc::positively_alive(rec.pid)
+                    && crate::proc::start_time_verified(rec.started_at, started.get(&rec.pid))
+                {
+                    Liveness::Verified
+                } else {
+                    Liveness::Inferred
+                },
+                last_seen: rec.status_updated_at.or(rec.started_at).unwrap_or(0),
+                transports,
+            };
+            if !report.push(agent) {
+                break;
+            }
+        }
+        Ok(report)
+    }
+
     pub fn self_socket() -> Option<String> {
         std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").ok()
     }
@@ -126,103 +252,19 @@ impl Adapter for ClaudeCode {
         RUNTIME
     }
 
-    fn discover(&self) -> Result<Vec<Agent>> {
-        if !self
-            .sessions_dir
-            .try_exists()
-            .context("checking Claude registry")?
-        {
-            return Ok(Vec::new());
-        }
-        // Read every record first, then resolve liveness for the whole set in
-        // one `ps` call rather than spawning a process per session.
-        let mut records = Vec::new();
-        for entry in fs::read_dir(&self.sessions_dir).context("reading Claude registry")? {
-            let path = entry.context("reading Claude registry entry")?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let raw = match crate::private_fs::read_owned(&path, 64 * 1024) {
-                Ok(raw) => raw,
-                Err(e) => {
-                    crate::warn(format!("skipping Claude record {path:?}: {e:#}"));
-                    continue;
-                }
-            };
-            let rec = match serde_json::from_str::<SessionRecord>(&raw) {
-                Ok(rec) => rec,
-                Err(e) => {
-                    crate::warn(format!("skipping malformed Claude record {path:?}: {e}"));
-                    continue;
-                }
-            };
-            if crate::proc::is_alive(rec.pid) {
-                records.push(rec);
-            }
-        }
+    fn discover(&self) -> Result<Discovery> {
+        self.discover_paths(None)
+    }
 
-        let pids: Vec<u32> = records.iter().map(|r| r.pid).collect();
-        let started = crate::proc::start_times(&pids);
-
-        let mut agents = Vec::new();
-        for rec in records {
-            // A registry entry outlives the process it describes, and pids get
-            // recycled. Without this check a message meant for a session that
-            // exited hours ago would be delivered to whatever now holds its pid.
-            if !crate::proc::start_time_matches(rec.started_at, started.get(&rec.pid)) {
-                crate::debug(|| {
-                    format!(
-                        "claude: skipping pid {} -- session recorded start {:?}, \
-                         but the process holding that pid started {:?}",
-                        rec.pid,
-                        rec.started_at,
-                        started.get(&rec.pid)
-                    )
-                });
-                continue;
-            }
-
-            let socket = rec.messaging_socket_path.as_ref().map(PathBuf::from);
-            let mut transports = Vec::new();
-            if let Some(sock) = socket {
-                if sock.try_exists().context("checking Claude socket path")? {
-                    let token = match self.token_for(rec.pid, &sock) {
-                        Ok(token) => Some(token),
-                        Err(e) => {
-                            crate::debug(|| format!("Claude native auth unavailable: {e:#}"));
-                            None
-                        }
-                    };
-                    if let Some(token) = token {
-                        transports.push(Transport::ClaudeUds {
-                            socket: sock,
-                            session_id: rec.session_id.clone(),
-                            token: Some(token),
-                        });
-                    }
-                }
-            }
-            transports.push(Transport::Inbox);
-
-            agents.push(Agent {
-                addr: format!("{RUNTIME}:{}", rec.pid),
-                runtime: RUNTIME,
-                name: rec.name.unwrap_or_else(|| format!("claude-{}", rec.pid)),
-                cwd: rec.cwd.map(PathBuf::from),
-                status: status_from(rec.status.as_deref()),
-                // Missing evidence keeps the record visible, never verified.
-                liveness: if crate::proc::positively_alive(rec.pid)
-                    && crate::proc::start_time_verified(rec.started_at, started.get(&rec.pid))
-                {
-                    Liveness::Verified
-                } else {
-                    Liveness::Inferred
-                },
-                last_seen: rec.status_updated_at.or(rec.started_at).unwrap_or(0),
-                transports,
-            });
-        }
-        Ok(agents)
+    fn find_exact(&self, address: &str) -> Result<Discovery> {
+        let address: crate::address::Address = address.parse()?;
+        let pid = address
+            .as_str()
+            .strip_prefix("claude:")
+            .context("not a Claude address")?
+            .parse::<u32>()
+            .context("Claude address requires a process id")?;
+        self.discover_paths(Some(pid))
     }
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
@@ -375,6 +417,48 @@ fn write_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_pid_lookup_bypasses_directory_scan_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        fs::write(
+            root.path().join(format!("{pid}.json")),
+            serde_json::json!({"pid":pid,"sessionId":"fixture"}).to_string(),
+        )
+        .unwrap();
+        for i in 0..discovery::MAX_ENTRIES {
+            fs::write(root.path().join(format!("unrelated-{i}")), b"").unwrap();
+        }
+        let adapter = ClaudeCode {
+            sessions_dir: root.path().to_owned(),
+        };
+        assert!(!adapter.discover().unwrap().complete);
+        let report = adapter.find_exact(&format!("claude:{pid}")).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.agents.len(), 1);
+        assert_eq!(report.agents[0].liveness, Liveness::Inferred);
+    }
+
+    #[test]
+    fn malformed_records_have_bounded_diagnostics_without_losing_valid_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("valid.json"),
+            serde_json::json!({"pid":std::process::id(),"sessionId":"fixture"}).to_string(),
+        )
+        .unwrap();
+        for i in 0..100 {
+            fs::write(root.path().join(format!("bad-{i}.json")), b"{partial").unwrap();
+        }
+        let adapter = ClaudeCode {
+            sessions_dir: root.path().to_owned(),
+        };
+        let report = adapter.discover().unwrap();
+        assert_eq!(report.agents.len(), 1);
+        assert!(!report.complete);
+        assert_eq!(report.warnings.len(), 64);
+        assert_eq!(report.warnings_omitted, 36);
+    }
 
     #[test]
     fn session_records_accept_present_or_absent_proc_start() {
@@ -406,7 +490,7 @@ mod tests {
         let adapter = ClaudeCode {
             sessions_dir: temp.path().to_owned(),
         };
-        let agents = adapter.discover().unwrap();
+        let agents = adapter.discover().unwrap().agents;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].liveness, Liveness::Inferred);
     }

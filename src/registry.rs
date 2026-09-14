@@ -5,6 +5,7 @@
 //! addressed in one namespace, so the rest of telephone never has to care
 //! which runtime something came from.
 
+use crate::discovery::{Code, Discovery};
 use crate::envelope::Envelope;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -149,11 +150,13 @@ pub trait Adapter {
 
     /// Enumerate live sessions. Should return `Ok(vec![])` rather than erroring
     /// when the runtime simply isn't installed.
-    fn discover(&self) -> Result<Vec<Agent>>;
+    fn discover(&self) -> Result<Discovery>;
 
-    fn discover_all(&self) -> Result<Vec<Agent>> {
+    fn discover_all(&self) -> Result<Discovery> {
         self.discover()
     }
+
+    fn find_exact(&self, address: &str) -> Result<Discovery>;
 
     /// Deliver `env` to `agent`, which this adapter produced.
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered>;
@@ -171,26 +174,32 @@ impl Registry {
 
     /// Discovery is best-effort per adapter: one broken runtime shouldn't
     /// hide every other agent on the box.
-    pub fn discover(&self) -> (Vec<Agent>, Vec<String>) {
+    pub fn discover(&self) -> Discovery {
         self.discover_with(false)
     }
 
-    pub fn discover_with(&self, all: bool) -> (Vec<Agent>, Vec<String>) {
-        let mut agents = Vec::new();
-        let mut warnings = Vec::new();
+    pub fn discover_with(&self, all: bool) -> Discovery {
+        let mut report = Discovery::default();
         for adapter in &self.adapters {
             match if all {
                 adapter.discover_all()
             } else {
                 adapter.discover()
             } {
-                Ok(found) => agents.extend(found),
-                Err(e) => warnings.push(format!("{}: {e}", adapter.runtime())),
+                Ok(found) => report.merge(found),
+                Err(e) => report.warn(
+                    adapter.runtime(),
+                    Code::SourceUnavailable,
+                    None,
+                    format!("{e:#}"),
+                ),
             }
         }
         // Most recently active first.
-        agents.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
-        (agents, warnings)
+        report
+            .agents
+            .sort_by_key(|a| std::cmp::Reverse(a.last_seen));
+        report
     }
 
     pub fn adapter_for(&self, agent: &Agent) -> Option<&dyn Adapter> {
@@ -201,10 +210,10 @@ impl Registry {
     }
 
     /// Resolve a user-typed name or address to exactly one agent.
-    pub fn resolve(&self, agents: &[Agent], q: &str) -> Result<Agent> {
+    pub fn resolve(&self, report: &mut Discovery, q: &str) -> Result<Agent> {
         if q.contains(':') {
             let address: crate::address::Address = q.parse()?;
-            if let Some(agent) = agents.iter().find(|a| a.addr == address.as_str()) {
+            if let Some(agent) = report.agents.iter().find(|a| a.addr == address.as_str()) {
                 return Ok(agent.clone());
             }
             let runtime = q.split_once(':').map(|(r, _)| r).unwrap_or("");
@@ -213,13 +222,20 @@ impl Registry {
                 .iter()
                 .find(|a| a.runtime() == runtime)
                 .ok_or_else(|| anyhow::anyhow!("unsupported address runtime"))?;
-            return adapter
-                .discover_all()?
-                .into_iter()
-                .find(|a| a.addr == q)
-                .ok_or_else(|| anyhow::anyhow!("no agent matches this exact address"));
+            let exact = adapter.find_exact(address.as_str())?;
+            let complete = exact.complete;
+            let agent = exact.agents.iter().find(|a| a.addr == q).cloned();
+            report.merge(exact);
+            return agent.ok_or_else(|| if complete {
+                anyhow::anyhow!("no agent matches this exact address")
+            } else {
+                anyhow::anyhow!("exact-address lookup was incomplete; absence is not confirmed (inspect discovery warnings)")
+            });
         }
-        let hits: Vec<&Agent> = agents.iter().filter(|a| a.matches(q)).collect();
+        if !report.complete {
+            anyhow::bail!("discovery is incomplete; use an exact address instead of a potentially ambiguous name");
+        }
+        let hits: Vec<&Agent> = report.agents.iter().filter(|a| a.matches(q)).collect();
         match hits.len() {
             0 => anyhow::bail!("no agent matches '{q}' (try `telephone list`)"),
             1 => Ok(hits[0].clone()),
@@ -262,15 +278,22 @@ mod tests {
     fn ambiguous_names_are_an_error_rather_than_a_guess() {
         // Sending to the wrong agent is worse than refusing to send.
         let registry = Registry::new(vec![]);
-        let agents = vec![agent("claude:1", "dup"), agent("codex:2", "dup")];
-        let err = registry.resolve(&agents, "dup").expect_err("should refuse");
+        let mut report = Discovery {
+            agents: vec![agent("claude:1", "dup"), agent("codex:2", "dup")],
+            ..Discovery::default()
+        };
+        let err = registry
+            .resolve(&mut report, "dup")
+            .expect_err("should refuse");
         assert!(err.to_string().contains("ambiguous"));
     }
 
     #[test]
     fn resolving_an_unknown_name_points_at_list() {
         let registry = Registry::new(vec![]);
-        let err = registry.resolve(&[], "nobody").expect_err("should fail");
+        let err = registry
+            .resolve(&mut Discovery::default(), "nobody")
+            .expect_err("should fail");
         assert!(err.to_string().contains("telephone list"));
     }
 }

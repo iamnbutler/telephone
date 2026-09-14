@@ -15,7 +15,7 @@ dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "limits"] }
 libc = "0.2"
 socket2 = "0.6"
 sha2 = "0.10"
