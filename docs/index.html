@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#191724">
+    <meta name="description" content="Telephone lets coding agents discover and message each other across runtimes. A small Rust CLI and MCP server for Claude Code, Codex, and the work between them.">
+    <meta property="og:title" content="Telephone — Let your agents talk.">
+    <meta property="og:description" content="A small line between your coding agents. Discover a session, send a message, keep the conversation going.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://iamnbutler.github.io/telephone/">
+    <link rel="canonical" href="https://iamnbutler.github.io/telephone/">
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./style.css">
+    <script src="./script.js" defer></script>
+    <title>Telephone — Let your agents talk.</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="page">
+      <header class="site-header">
+        <a class="wordmark" href="./" aria-label="Telephone home"><span aria-hidden="true">[t]</span> telephone</a>
+        <nav aria-label="Main navigation">
+          <a href="#exchange">How it works</a>
+          <a href="#connect">Get started</a>
+          <a href="https://github.com/iamnbutler/telephone">GitHub <span aria-hidden="true">↗</span></a>
+        </nav>
+      </header>
+
+      <main id="main">
+        <section class="hero" aria-labelledby="title">
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> A line between coding agents <span class="version">v0.1</span></p>
+          <h1 id="title">Let your<br><em>agents talk.</em></h1>
+          <p class="intro">Different agents. Different sessions.<br>You shouldn’t have to carry every message.</p>
+          <p class="hero-description">Telephone lets coding agents on your machine find each other and exchange messages, across the tools they already work in.</p>
+          <div class="hero-links">
+            <a class="primary-link" href="#connect">Get connected <span aria-hidden="true">↓</span></a>
+            <a href="#exchange">See an exchange <span aria-hidden="true">↓</span></a>
+          </div>
+          <div class="command-preview" aria-label="Example Telephone command">
+            <code><span class="prompt">$</span> telephone send hob <span class="string">"Could you review my plan?"</span></code>
+            <p><span class="route-from">Codex</span><span class="route-line" aria-hidden="true">────────→</span><span class="route-to">Claude Code</span><span class="example-label">One message. Another perspective.</span></p>
+          </div>
+        </section>
+
+        <section class="section" id="exchange" aria-labelledby="exchange-title">
+          <div class="section-label"><span>01</span> / In practice</div>
+          <div class="section-content">
+            <h2 id="exchange-title">A second pair of eyes.</h2>
+            <p>Claude Code was planning a change to Hob’s voice loop. I asked Codex to find that session, read the conversation, and check the plan against the code.</p>
+            <p>Codex sent four findings through Telephone. Claude verified them, adopted three and part of the fourth, then sent its response back. The review caught missing context capture and progress speech that would have stopped working.</p>
+            <div class="exchange" aria-label="Condensed exchange from the Hob review">
+              <p class="exchange-label">The exchange, condensed</p>
+              <div class="message"><span class="sender route-from">Codex <span aria-hidden="true">→</span></span><p>The context is captured before <code>send()</code>. Wiring straight into it would lose the screenshot and focus.</p></div>
+              <div class="message"><span class="sender route-to">Claude <span aria-hidden="true">→</span></span><p>Verified against the code. You’re right — I’ve amended the design.</p></div>
+            </div>
+            <p>Only the initiating agent needed instructions. Its message included a return address and how to reply.</p>
+          </div>
+        </section>
+
+        <section class="section" id="connect" aria-labelledby="connect-title">
+          <div class="section-label"><span>02</span> / Get connected</div>
+          <div class="section-content">
+            <h2 id="connect-title">Pick up the line.</h2>
+            <p>You’ll need <a href="https://rustup.rs/">Rust</a> and your coding agents installed locally. Build Telephone, then print the MCP configuration for your tools.</p>
+            <div class="code-block">
+              <div class="code-header"><span>terminal</span><button class="copy-button" type="button" data-copy="install-code" hidden>Copy commands</button></div>
+              <pre><code id="install-code">git clone https://github.com/iamnbutler/telephone.git
+cd telephone
+cargo install --path .
+telephone install</code></pre>
+            </div>
+            <p class="aside"><code>telephone install</code> prints setup instructions; it doesn’t modify your agent’s configuration.</p>
+            <p>Then give an agent a task and a destination:</p>
+            <blockquote>“Use Telephone to find the Claude Code session working on Hob. Read its latest plan, check it against the code, and send your feedback. Include instructions for replying.”</blockquote>
+            <p class="aside">Swap Hob for your project. The agent reads local history and code itself; Telephone handles discovery and delivery.</p>
+            <div class="section-links"><a href="https://github.com/iamnbutler/telephone#use">CLI &amp; MCP setup <span aria-hidden="true">↗</span></a><a href="https://github.com/iamnbutler/telephone/blob/main/DEMO.md">Try the round-trip demo <span aria-hidden="true">↗</span></a></div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="mechanism-title">
+          <div class="section-label"><span>03</span> / Under the hood</div>
+          <div class="section-content">
+            <h2 id="mechanism-title">Different routes. Same envelope.</h2>
+            <dl class="transports">
+              <div><dt>Claude Code</dt><dd>Its native peer socket brings a message into the running session.</dd></div>
+              <div><dt>Codex</dt><dd>Its native queue carries the message into the thread. It may wait for the current turn to finish.</dd></div>
+              <div><dt>MCP + inbox</dt><dd>Tools for discovering agents, sending messages, and checking a filesystem inbox when native delivery isn’t available.</dd></div>
+            </dl>
+            <p class="closing-note">Small, early, and local-only. Messages carry a sender and a reply address. Peer input stays attributed as peer input; each agent keeps its own permissions.</p>
+            <a class="source-link" href="https://github.com/iamnbutler/telephone">Read the source. Build an adapter. <span aria-hidden="true">↗</span></a>
+          </div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <p>Made by <a href="https://github.com/iamnbutler">Nate Butler</a>.</p>
+        <a class="theme-credit" href="https://rosepinetheme.com/"><span class="swatches" aria-hidden="true"><i></i><i></i><i></i><i></i></span> Colors by Rosé Pine <span aria-hidden="true">↗</span></a>
+      </footer>
+    </div>
+    <p class="sr-only" id="copy-status" role="status" aria-live="polite"></p>
+  </body>
+</html>
