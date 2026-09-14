@@ -49,11 +49,13 @@ arrive in the target session as a real turn. This protocol is undocumented and
 was determined by inspection, so it may break on any Claude Code release —
 telephone degrades to the inbox rather than failing.
 
-**Codex** (pull). Codex has no inter-session protocol at all, which makes it the
-case that decides whether "agent-agnostic" means anything. Discovery reads the
+**Codex** (native queue, with inbox fallback). Discovery reads the
 `threads` table of `~/.codex/state_<n>.sqlite`, falling back to parsing the
-`session_meta` header of each rollout log. Delivery goes to a filesystem inbox
-that Codex drains by calling the telephone MCP server.
+`session_meta` header of each rollout log. Delivery uses
+`codex queue --thread <id> --message <text>` when available. Success means
+Codex accepted the message into its queue, not that the agent has read it.
+If the CLI cannot queue it, delivery falls back to a filesystem inbox that
+Codex drains by calling the telephone MCP server.
 
 **Anything else** (pull). Run `telephone mcp`. Nearly every serious agent speaks
 MCP, which makes an MCP server a de facto universal channel: `send_message` and
@@ -86,6 +88,45 @@ telephone mcp                       # run as an MCP server over stdio
 
 Addresses are `<runtime>:<local-id>` (`claude:83487`). You can also use an
 agent's display name (`luau-4c`), or the bare local id when it's unambiguous.
+
+## Codex ↔ Claude Code demo
+
+Requires Rust, authenticated `claude` and `codex` CLIs, and `jq`.
+From a Codex session's shell, run:
+
+```sh
+bash scripts/demo-claude.sh
+```
+
+Or start it in a separate terminal, passing the exact Codex address shown by
+`target/debug/telephone list`:
+
+```sh
+bash scripts/demo-claude.sh codex:<thread-id>
+```
+
+The script builds Telephone and starts a Claude Code session named
+`telephone-demo`, with three Telephone MCP tools configured for that invocation.
+Claude discovers its own address, sends Codex a greeting, and stays available.
+From Codex, send a request to the Claude address it reports:
+
+```sh
+target/debug/telephone send claude:<pid> --kind request \
+  'Demo nonce: switchboard-914. Reply once with this nonce and an original sentence.'
+```
+
+Claude receives it over its native socket and replies through the MCP
+`send_message` tool. The reply is routed through `codex queue`; if that transport
+is unavailable, check `target/debug/telephone inbox` from the Codex session.
+Both sides carry message IDs, and Claude includes `reply_to` for correlation.
+The demo prompt permits replies to requests only, avoiding an endless exchange.
+Exit Claude with `/exit` when finished.
+
+Sandboxed hosts may need approval to connect to another runtime's socket or
+write to its queue. Claude MCP processes may not receive `CLAUDE_PID`, so
+Telephone also checks the direct parent's Claude session record before using
+inherited Codex environment variables. After rebuilding Telephone, reconnect
+its MCP server with Claude's `/mcp` menu to load the new binary.
 
 ## Design notes
 

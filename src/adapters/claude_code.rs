@@ -86,10 +86,20 @@ impl ClaudeCode {
 
     /// The address of *this* process's session, if we're running inside one.
     ///
-    /// Claude Code puts the socket and token straight into the environment of
-    /// everything it spawns, which is what lets a subprocess send as itself.
+    /// Claude Code supplies CLAUDE_PID to shell children. MCP children may
+    /// instead need the parent-session lookup below.
     pub fn self_address() -> Option<String> {
         std::env::var("CLAUDE_PID").ok().map(|p| format!("{RUNTIME}:{p}"))
+    }
+
+    /// MCP children do not always receive CLAUDE_PID. Check the direct
+    /// parent's session record before trusting an inherited Codex thread id.
+    pub fn parent_address() -> Option<String> {
+        let pid = crate::proc::parent_pid();
+        let adapter = Self::new().ok()?;
+        let raw = fs::read_to_string(adapter.sessions_dir.join(format!("{pid}.json"))).ok()?;
+        let record: SessionRecord = serde_json::from_str(&raw).ok()?;
+        (record.pid == pid).then(|| format!("{RUNTIME}:{pid}"))
     }
 
     pub fn self_socket() -> Option<String> {

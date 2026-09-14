@@ -30,8 +30,16 @@ pub fn whoami() -> Me {
         }
     }
 
-    // 2. Claude Code hands its children the pid, the socket and the token.
-    if let Some(addr) = crate::adapters::claude_code::ClaudeCode::self_address() {
+    // 2. Shell children receive CLAUDE_PID; MCP children may only have their
+    // parent's session record. Both beat Codex variables inherited when Claude
+    // was launched from a Codex session.
+    let claude = crate::adapters::claude_code::ClaudeCode::self_address()
+        .map(|addr| (addr, "CLAUDE_PID"))
+        .or_else(|| {
+            crate::adapters::claude_code::ClaudeCode::parent_address()
+                .map(|addr| (addr, "Claude parent session"))
+        });
+    if let Some((addr, source)) = claude {
         let name = crate::adapters::claude_code::ClaudeCode::new()
             .ok()
             .and_then(|a| a.discover().ok())
@@ -42,20 +50,35 @@ pub fn whoami() -> Me {
             addr: Some(addr),
             runtime: Some("claude"),
             name,
-            source: "CLAUDE_PID",
+            source,
         };
     }
 
-    // 3. Codex tells a spawned MCP server nothing about which thread it is, so
-    //    fall back to matching the most recently written rollout for this cwd.
-    //    This is a guess and is labelled as one.
+    // 3. Codex puts the thread id into the environment of everything it
+    //    spawns, including MCP servers, so this is exact rather than inferred.
+    for var in ["CODEX_THREAD_ID", "CODEX_SESSION_ID"] {
+        if let Ok(id) = std::env::var(var) {
+            if !id.trim().is_empty() {
+                let short: String = id.chars().take(8).collect();
+                return Me {
+                    addr: Some(format!("codex:{id}")),
+                    runtime: Some("codex"),
+                    name: Some(format!("codex-{short}")),
+                    source: var,
+                };
+            }
+        }
+    }
+
+    // 4. Older Codex builds leak nothing useful, so fall back to matching the
+    //    most recently touched thread for this cwd. This is a guess, and says so.
     if std::env::var("CODEX_HOME").is_ok() {
         if let Some(agent) = codex_self_guess() {
             return Me {
                 addr: Some(agent.addr),
                 runtime: Some("codex"),
                 name: Some(agent.name),
-                source: "codex rollout (inferred from cwd)",
+                source: "codex thread (inferred from cwd)",
             };
         }
     }

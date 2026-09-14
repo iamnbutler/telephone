@@ -36,6 +36,9 @@ pub enum Transport {
         session_id: String,
         token: Option<String>,
     },
+    /// Codex's own CLI, which can push a message into a thread's queue even
+    /// when that thread isn't currently open.
+    CodexQueue,
     /// The universal fallback: a filesystem inbox the agent drains itself,
     /// via the telephone MCP server or a shell hook.
     Inbox,
@@ -45,6 +48,7 @@ impl Transport {
     pub fn label(&self) -> &'static str {
         match self {
             Transport::ClaudeUds { .. } => "uds",
+            Transport::CodexQueue => "queue",
             Transport::Inbox => "inbox",
         }
     }

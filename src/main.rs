@@ -242,7 +242,9 @@ fn cmd_doctor() -> Result<()> {
             Ok(found) => {
                 let native = found
                     .iter()
-                    .filter(|a| a.transports.first().map(|t| t.label()) == Some("uds"))
+                    .filter(|a| {
+                        !matches!(a.transports.first(), None | Some(registry::Transport::Inbox))
+                    })
                     .count();
                 println!(
                     "  {:<8} ok       {} agent(s), {native} reachable natively",

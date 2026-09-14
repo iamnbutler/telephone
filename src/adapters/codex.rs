@@ -11,13 +11,15 @@
 //!   last-updated time. When that database isn't readable -- Codex holds it
 //!   open in WAL mode -- we fall back to parsing the `session_meta` line at the
 //!   head of each rollout log under `~/.codex/sessions/`.
-//! - **Delivery** is the universal fallback: the message lands in a filesystem
-//!   inbox and Codex collects it by calling the telephone MCP server's
-//!   `check_inbox` tool. Codex supports MCP, and that is the entire reason
-//!   this works without any cooperation from the runtime.
+//! - **Delivery** uses `codex queue --thread <id> --message <text>`, which
+//!   pushes a message into a thread's queue. This works even for a thread that
+//!   isn't currently open -- Codex delivers it when the thread next runs.
+//!   When the CLI isn't available we fall back to a filesystem inbox that
+//!   Codex drains via the telephone MCP server's `check_inbox` tool.
 //!
-//! The tradeoff is worth stating plainly: delivery here is pull, not push.
-//! Codex sees a message when it next looks, not when it arrives.
+//! `codex queue` is a real push channel, so Codex is not the pull-only case it
+//! first appears to be. The difference from Claude Code's socket is latency and
+//! confirmation: we learn the message was queued, not that it was seen.
 
 use crate::envelope::Envelope;
 use crate::inbox;
@@ -26,6 +28,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RUNTIME: &str = "codex";
@@ -203,7 +206,11 @@ fn build_agent(id: &str, cwd: Option<String>, label: &str, last_seen: u64) -> Ag
         cwd: cwd.map(PathBuf::from),
         status: Status::Unknown,
         last_seen,
-        transports: vec![Transport::Inbox],
+        transports: if codex_cli().is_some() {
+            vec![Transport::CodexQueue, Transport::Inbox]
+        } else {
+            vec![Transport::Inbox]
+        },
     }
 }
 
@@ -261,12 +268,67 @@ impl Adapter for Codex {
     }
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
+        let thread = agent
+            .addr
+            .split_once(':')
+            .map(|(_, id)| id)
+            .unwrap_or(&agent.addr);
+
+        if let Some(cli) = codex_cli() {
+            match queue_message(&cli, thread, env) {
+                Ok(()) => return Ok(Delivered::Native { via: "codex queue" }),
+                Err(e) => crate::debug(|| format!("codex: queue failed ({e}); using inbox")),
+            }
+        }
+
         let path = inbox::deposit(&agent.addr, env)?;
         Ok(Delivered::Queued {
             path,
-            note: "Codex has no push channel; it will see this when it calls the \
-                   telephone MCP server's check_inbox tool"
+            note: "the codex CLI wasn't usable, so this is waiting in the inbox; \
+                   Codex will see it when it calls the telephone MCP server's \
+                   check_inbox tool"
                 .into(),
         })
     }
+}
+
+/// Locates the Codex CLI.
+///
+/// Codex ships inside the ChatGPT desktop app as well as standalone, so an
+/// installed-and-working Codex often isn't on `PATH` at all.
+fn codex_cli() -> Option<PathBuf> {
+    // Codex sets this in the environment of MCP servers it spawns, which makes
+    // it the most reliable source when we're running under Codex ourselves.
+    if let Ok(p) = std::env::var("CODEX_CLI_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(out) = Command::new("sh").arg("-c").arg("command -v codex").output() {
+        let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !found.is_empty() {
+            return Some(PathBuf::from(found));
+        }
+    }
+    let bundled = PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex");
+    bundled.is_file().then_some(bundled)
+}
+
+/// Pushes a message into a Codex thread's queue.
+fn queue_message(cli: &PathBuf, thread: &str, env: &Envelope) -> Result<()> {
+    let out = Command::new(cli)
+        .arg("queue")
+        .arg("--thread")
+        .arg(thread)
+        .arg("--message")
+        .arg(crate::adapters::format_for_delivery(env))
+        .output()
+        .context("running `codex queue`")?;
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("codex queue failed: {}", err.trim());
+    }
+    Ok(())
 }
