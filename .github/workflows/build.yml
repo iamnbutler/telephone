@@ -2,6 +2,7 @@ name: Build and release
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main]
     tags: ['v*']
@@ -10,7 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
+  # A manual notarization check need not queue behind the ordinary main build.
+  group: build-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 defaults:
@@ -86,9 +88,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --locked --all-targets --target "$TARGET" -- -D warnings
-      - name: Test signing preflight
+      - name: Test signing and notarization preflight
         if: runner.os == 'macOS'
-        run: bash scripts/test-sign-macos.sh
+        run: |
+          bash scripts/test-sign-macos.sh
+          bash scripts/test-notarize-macos.sh
       - name: Package and smoke-test
         run: bash scripts/package.sh "$TARGET"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -99,12 +103,15 @@ jobs:
           retention-days: 7
 
   sign-macos:
-    name: Sign (${{ matrix.target }})
+    name: Sign and notarize (${{ matrix.target }})
     # Never expose signing credentials to a pull request, including same-repo PRs.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # A manual run tests merged main without publishing a release.
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +122,6 @@ jobs:
             target: x86_64-apple-darwin
     env:
       TARGET: ${{ matrix.target }}
-      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -124,13 +130,34 @@ jobs:
         with:
           name: telephone-${{ matrix.target }}
           path: artifacts
+      - name: Read package version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "telephone") | .version')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'PACKAGE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
       - name: Developer ID sign and verify
+        timeout-minutes: 5
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
           MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
         run: bash scripts/sign-macos.sh "$TARGET" "artifacts/telephone-$TARGET.tar.gz" "signed/telephone-$TARGET.tar.gz"
+      - name: Notarize signed binary
+        timeout-minutes: 30
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: bash scripts/notarize-macos.sh "$TARGET" "signed/telephone-$TARGET.tar.gz" "notarization/$TARGET"
+      - name: Preserve notarization receipt and log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notarization-${{ matrix.target }}
+          path: notarization/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
       # The signing step has removed its keychain, and no secrets are in this
       # step's environment. Only now execute the signed build output.
       - name: Smoke-test signed archive
@@ -138,7 +165,7 @@ jobs:
           extracted=$(mktemp -d "$RUNNER_TEMP/telephone-signed-check.XXXXXX")
           tar -xzf "signed/telephone-$TARGET.tar.gz" -C "$extracted"
           codesign --verify --strict "$extracted/telephone"
-          bash scripts/smoke-test.sh "$extracted/telephone" "${RELEASE_TAG#v}"
+          bash scripts/smoke-test.sh "$extracted/telephone" "$PACKAGE_VERSION"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: signed-telephone-${{ matrix.target }}
@@ -148,7 +175,7 @@ jobs:
 
   publish:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [build, sign-macos]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
