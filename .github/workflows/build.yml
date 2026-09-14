@@ -38,7 +38,9 @@ jobs:
       TARGET: ${{ matrix.target }}
       RELEASE_TAG: ${{ github.ref_name }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # Let rustc supply its matching musl startup objects and static libraries.
+      # The distro musl-gcc wrapper can mix in incompatible static-PIE objects.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: cc
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
