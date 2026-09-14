@@ -342,17 +342,30 @@ fn send_uds(mut stream: UnixStream, session_id: &str, token: &str, env: &Envelop
         "message": { "content": crate::adapters::format_for_delivery(env) },
     });
     let payload = format!("{auth}\n{msg}\n");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut bytes = payload.as_bytes();
+    write_until(
+        &mut stream,
+        payload.as_bytes(),
+        Instant::now() + Duration::from_secs(5),
+    )
+}
+
+/// Nonblocking I/O avoids platform-dependent socket timeout options. This stream
+/// is owned by one delivery; changing its mode cannot affect another session.
+fn write_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    stream
+        .set_nonblocking(true)
+        .context("making Claude delivery nonblocking")?;
     while !bytes.is_empty() {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .context("Claude write deadline exceeded")?;
-        stream.set_write_timeout(Some(remaining))?;
         match stream.write(bytes) {
             Ok(0) => anyhow::bail!("Claude socket closed during write"),
             Ok(n) => bytes = &bytes[n..],
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
             Err(e) => return Err(e).context("writing Claude message"),
         }
     }
@@ -400,24 +413,43 @@ mod tests {
 
     #[test]
     fn real_socket_delivery_reports_unconfirmed_and_frames_are_valid_json() {
-        use std::io::{BufRead, BufReader};
+        use std::io::Read;
         use std::os::unix::net::UnixListener;
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("peer.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let receiver = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut frames = Vec::new();
-            for _ in 0..2 {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                frames.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                assert!(Instant::now() < deadline, "peer never connected");
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            stream.set_nonblocking(true).unwrap();
+            let mut bytes = Vec::new();
+            while bytes.iter().filter(|b| **b == b'\n').count() < 2 {
+                assert!(Instant::now() < deadline, "frames never arrived");
+                let mut buffer = [0; 4096];
+                match stream.read(&mut buffer) {
+                    Ok(0) => panic!("socket closed before both frames arrived"),
+                    Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("read failed: {e}"),
+                }
             }
-            frames
+            String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
         });
         let mut env = Envelope::new(
             "codex:sender",
@@ -479,5 +511,27 @@ mod tests {
         assert!(adapter
             .token_for(123, &temp.path().join("different.sock"))
             .is_err());
+    }
+
+    #[test]
+    fn stalled_socket_writes_obey_deadline_and_closed_peers_fail() {
+        let (mut sender, peer) = UnixStream::pair().unwrap();
+        // Real backpressure, not a mocked writer: fill a small socket buffer.
+        socket2::SockRef::from(&sender)
+            .set_send_buffer_size(4096)
+            .unwrap();
+        let payload = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let error =
+            write_until(&mut sender, &payload, started + Duration::from_millis(150)).unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(peer);
+        assert!(write_until(
+            &mut sender,
+            b"message",
+            Instant::now() + Duration::from_secs(1)
+        )
+        .is_err());
     }
 }
