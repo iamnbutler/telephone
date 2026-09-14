@@ -1,1 +1,5 @@
 /target
+
+# Local publishing workflow notes and helper; not part of the project.
+NEXT_CLOUD.md
+scripts/next-cloud.mjs
