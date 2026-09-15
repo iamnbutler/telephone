@@ -22,6 +22,7 @@ mod adapters;
 mod address;
 mod discovery;
 mod envelope;
+mod guidance;
 mod identity;
 mod inbox;
 mod mcp;
@@ -101,7 +102,7 @@ enum Command {
         /// Optional display name (not a unique identifier)
         #[arg(long)]
         name: Option<String>,
-        /// Include lease timestamps as JSON; otherwise print just the address
+        /// Include lease timestamps and polling instructions as JSON
         #[arg(long)]
         json: bool,
     },
@@ -194,7 +195,7 @@ fn run() -> Result<()> {
                 envelope::now_millis(),
             )?;
             let output = if json {
-                serde_json::to_string(&registration)?
+                serde_json::to_string(&guidance::RegistrationReport::new(&registration))?
             } else {
                 registration.address.to_string()
             };
@@ -202,7 +203,22 @@ fn run() -> Result<()> {
             writeln!(stdout, "{output}").context("writing registration; it may already exist")?;
             stdout
                 .flush()
-                .context("flushing registration; it may already exist")
+                .context("flushing registration; it may already exist")?;
+            if !json {
+                // Keep stdout address-only for command substitution. Advice is
+                // best-effort: a broken stderr must not imply registration failed.
+                let mut stderr = std::io::stderr().lock();
+                if writeln!(
+                    stderr,
+                    "{}",
+                    guidance::Polling::new(&registration.address).text(None)
+                )
+                .is_err()
+                {
+                    // The address was already flushed; do not retry registration.
+                }
+            }
+            Ok(())
         }
         Command::Unregister { address } => {
             let address = match address {

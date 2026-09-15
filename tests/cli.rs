@@ -28,6 +28,58 @@ fn success(home: &std::path::Path, identity: Option<&str>, args: &[&str]) -> Str
     String::from_utf8(out.stdout).unwrap()
 }
 
+fn assert_polling_text(text: &str, address: &str) {
+    assert!(
+        text.contains("Telephone will not wake this thread"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("check_inbox with {{\"address\":\"{address}\"}}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("TELEPHONE_ADDR='{address}' telephone inbox")));
+    assert!(text.contains("every 2 seconds for up to 30 seconds"));
+    assert!(text.contains("otherwise report it pending"));
+    assert!(text.contains("Do not resend because the inbox is empty"));
+    assert!(text.contains("acknowledge acknowledgments"));
+}
+
+#[test]
+fn cli_registration_teaches_polling_without_changing_address_only_stdout() {
+    use serde_json::Value;
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated(home.path(), None)
+        .args(["register", "--runtime", "delta"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let address = stdout.trim();
+    assert_eq!(stdout.lines().count(), 1);
+    assert!(address.starts_with("delta:"));
+    assert!(uuid::Uuid::parse_str(address.strip_prefix("delta:").unwrap()).is_ok());
+    assert_polling_text(&String::from_utf8(output.stderr).unwrap(), address);
+
+    let report: Value = serde_json::from_str(&success(
+        home.path(),
+        Some(address),
+        &["register", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(report["address"], address);
+    assert!(report["last_seen"].is_number());
+    assert!(report["expires_at"].is_number());
+    assert_eq!(report["receiving"]["check_inbox"]["tool"], "check_inbox");
+    assert_eq!(
+        report["receiving"]["check_inbox"]["arguments"]["address"],
+        address
+    );
+    assert!(report["receiving"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("poll your own inbox"));
+}
+
 #[test]
 fn separate_cli_processes_exchange_replies_for_each_registered_runtime() {
     use serde_json::Value;
@@ -44,12 +96,14 @@ fn separate_cli_processes_exchange_replies_for_each_registered_runtime() {
             &["send", second, "hello", "--kind", "request"],
         );
         assert!(out.contains("Queued in Telephone inbox"));
+        assert_polling_text(&out, first);
         let inbox: Value =
             serde_json::from_str(&success(home.path(), Some(second), &["inbox", "--json"]))
                 .unwrap();
         assert_eq!(inbox[0]["from"], first);
         assert_eq!(inbox[0]["body"], "hello");
         let id = inbox[0]["id"].as_str().unwrap();
+        assert!(out.contains(&format!("in reply to'): {id}.")));
         success(
             home.path(),
             Some(second),
@@ -167,6 +221,15 @@ fn shared_mcp_server_keeps_thread_addresses_separate_and_cli_can_reply() {
         json!({"runtime":"zed","name":"same-name"}),
     ))
     .unwrap();
+    // Execute the returned recipe against the actual MCP process, not a mock.
+    let recipe = &one["receiving"]["check_inbox"];
+    let empty: Value = serde_json::from_str(&mcp.tool(
+        recipe["tool"].as_str().unwrap(),
+        recipe["arguments"].clone(),
+    ))
+    .unwrap();
+    assert_eq!(empty["messages"], json!([]));
+    assert_eq!(recipe["arguments"]["address"], one["address"]);
     let two: Value = serde_json::from_str(&mcp.tool(
         "register_agent",
         json!({"runtime":"zed","name":"same-name"}),
@@ -181,10 +244,11 @@ fn shared_mcp_server_keeps_thread_addresses_separate_and_cli_can_reply() {
     assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
     assert_eq!(listed["agents"][0]["address"], two);
     assert_eq!(listed["agents"][0]["transport"], "inbox");
-    mcp.tool(
+    let sent = mcp.tool(
         "send_message",
         json!({"from":one,"to":two,"body":"thread-specific request","kind":"request"}),
     );
+    assert_polling_text(&sent, one);
     let inbox: Value =
         serde_json::from_str(&success(home.path(), Some(two), &["inbox", "--json"])).unwrap();
     let id = inbox[0]["id"].as_str().unwrap();
@@ -303,11 +367,14 @@ fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
     let out = success(
         home.path(),
         Some(sender),
-        &["send", &claude, "native request", "--kind", "request"],
+        // The real-client regression used inform despite asking for a reply.
+        &["send", &claude, "native request", "--kind", "inform"],
     );
     assert!(out.contains("Written over uds"));
+    assert_polling_text(&out, sender);
     let received = receiving.join().unwrap();
     let id = received["msg_id"].as_str().unwrap();
+    assert!(out.contains(&format!("in reply to'): {id}.")));
     assert!(received["message"]["content"]
         .as_str()
         .unwrap()
@@ -317,7 +384,7 @@ fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
         .query_row("SELECT count(*) FROM inbox", [], |r| r.get(0))
         .unwrap();
     assert_eq!(queued, 0, "native sends must not also be queued");
-    success(
+    let native_reply = success(
         home.path(),
         Some(&claude),
         &[
@@ -330,6 +397,8 @@ fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
             id,
         ],
     );
+    assert!(!native_reply.contains("Receiving replies:"));
+    assert!(!native_reply.contains("Telephone will not wake this thread"));
     let reply: Value =
         serde_json::from_str(&success(home.path(), Some(sender), &["inbox", "--json"])).unwrap();
     assert_eq!(reply[0]["reply_to"], id);
@@ -339,6 +408,7 @@ fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
         &["send", &claude, "safe fallback"],
     );
     assert!(out.contains("Queued in Telephone inbox"));
+    assert_polling_text(&out, sender);
     let inbox: Value =
         serde_json::from_str(&success(home.path(), Some(&claude), &["inbox", "--json"])).unwrap();
     assert_eq!(inbox.as_array().unwrap().len(), 1);
@@ -379,7 +449,13 @@ fn native_failure_after_connection_never_queues_a_duplicate() {
         .unwrap();
     receiving.join().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("uncertain"));
+    // CLI errors are JSON-escaped to keep terminal control characters inert.
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let error: String =
+        serde_json::from_str(stderr.trim().strip_prefix("error: ").unwrap()).unwrap();
+    assert!(error.contains("uncertain"));
+    assert_polling_text(&error, sender.trim());
+    assert!(error.contains("inspect before retrying"));
     let db = rusqlite::Connection::open(home.path().join(".telephone/messages.sqlite")).unwrap();
     let count: i64 = db
         .query_row("SELECT count(*) FROM inbox", [], |r| r.get(0))
