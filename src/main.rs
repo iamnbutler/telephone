@@ -176,7 +176,7 @@ enum Command {
     /// Run as an MCP server over stdio (the universal adapter)
     Mcp,
 
-    /// Check what telephone can see and reach
+    /// Report discovered agents, configured routes and liveness evidence
     Doctor,
 
     /// Print the configuration needed to wire telephone into each runtime
@@ -479,7 +479,7 @@ fn cmd_doctor() -> Result<()> {
                     ));
                 }
                 let found = found.agents;
-                let native = found
+                let native_routes = found
                     .iter()
                     .filter(|a| {
                         !matches!(
@@ -496,7 +496,7 @@ fn cmd_doctor() -> Result<()> {
                     any_inferred = true;
                 }
                 println!(
-                    "  {:<8} ok       {} agent(s), {native} reachable natively, \
+                    "  {:<8} ok       {} agent(s), {native_routes} native route(s) configured, \
                      {confirmed} confirmed live",
                     adapter.runtime(),
                     found.len()
@@ -509,6 +509,8 @@ fn cmd_doctor() -> Result<()> {
             ),
         }
     }
+
+    println!("\nA configured native route is not proof of reachability or receipt.");
 
     if any_inferred {
         // Explain the gap rather than leaving "recent?" to be guessed at.
