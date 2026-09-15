@@ -39,6 +39,33 @@ fn no_model_context() -> PromptContext {
     }
 }
 
+fn blocking_fault_stream(stream: std::net::TcpStream) -> std::net::TcpStream {
+    // macOS inherits O_NONBLOCK from the listener. read_exact/write_all do not
+    // wait on WouldBlock, and socket timeouts do not make nonblocking I/O wait.
+    stream.set_nonblocking(false).unwrap();
+    stream
+}
+
+#[test]
+fn fault_stream_waits_for_its_read_timeout_instead_of_immediate_would_block() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    // Force the inherited state even on platforms that do not inherit it.
+    stream.set_nonblocking(true).unwrap();
+    let mut stream = blocking_fault_stream(stream);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let start = Instant::now();
+    let error = stream.read_exact(&mut [0]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    assert!(start.elapsed() >= Duration::from_millis(75));
+}
+
 // Consume the request before returning a fault response. Closing a socket with
 // unread request bytes can reset it and mask the response we intend to exercise.
 fn drain_request(stream: &mut std::net::TcpStream) {
@@ -236,7 +263,7 @@ fn post_disconnect_and_redirect_are_uncertain_without_retry() {
         // Real TCP fault injection: drop after a request byte or return a redirect.
         let receiver = std::thread::spawn(move || {
             let start = Instant::now();
-            let mut stream = loop {
+            let mut stream = blocking_fault_stream(loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -245,7 +272,7 @@ fn post_disconnect_and_redirect_are_uncertain_without_retry() {
                     }
                     Err(e) => panic!("{e}"),
                 }
-            };
+            });
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -319,7 +346,7 @@ fn http_response_headers_body_and_wait_are_bounded() {
         let route = Route::try_from(config).unwrap();
         let receiver = std::thread::spawn(move || {
             let start = Instant::now();
-            let mut stream = loop {
+            let mut stream = blocking_fault_stream(loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -328,12 +355,17 @@ fn http_response_headers_body_and_wait_are_bounded() {
                     }
                     Err(e) => panic!("{e}"),
                 }
-            };
+            });
             stream
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
             stream
                 .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            // Exercise partial writes/backpressure without relying on a host's
+            // default buffer size. The full response must still reach the reader.
+            socket2::SockRef::from(&stream)
+                .set_send_buffer_size(1024)
                 .unwrap();
             drain_request(&mut stream);
             let response = match fault {
@@ -349,10 +381,13 @@ fn http_response_headers_body_and_wait_are_bounded() {
                 }
             };
             if let Err(error) = stream.write_all(response.as_bytes()) {
-                assert!(matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ));
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "fault response write failed: {error:?}"
+                );
             }
         });
         let start = Instant::now();
