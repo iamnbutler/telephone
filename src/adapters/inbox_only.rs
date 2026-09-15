@@ -1,4 +1,4 @@
-//! Known runtimes without a verified native route. An explicit lease makes them pollable.
+//! Registered inboxes, with an optional explicitly bound OpenCode native route.
 use crate::{
     discovery::{Code, Discovery},
     envelope::{now_millis, Envelope},
@@ -20,7 +20,35 @@ impl InboxOnly {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Discovery::default()),
             Err(e) => return Err(e).context("checking registration journal"),
         }
-        Store::open(&self.root)?.registrations(self.runtime, exact, now_millis())
+        let store = Store::open(&self.root)?;
+        let mut report = store.registrations(self.runtime, exact, now_millis())?;
+        if self.runtime == "opencode" {
+            let mut warnings = Vec::new();
+            report.agents.retain_mut(|agent| {
+                match agent
+                    .addr
+                    .parse()
+                    .and_then(|address| store.opencode_route(&address))
+                {
+                    Ok(Some(route)) => {
+                        agent
+                            .transports
+                            .insert(0, crate::registry::Transport::OpenCodeHttp);
+                        agent.cwd = Some(route.directory.into());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warnings.push(format!("{}: {error:#}", agent.addr));
+                        return false;
+                    }
+                }
+                true
+            });
+            for warning in warnings {
+                report.warn(self.runtime, Code::SourceUnavailable, None, warning);
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -56,10 +84,21 @@ impl Adapter for InboxOnly {
             bail!("registered inbox target mismatch");
         }
         let mut store = Store::open(&self.root)?;
+        let mut native_note = String::new();
+        if self.runtime == "opencode" {
+            if let Some(route) = store.opencode_route(&env.to)? {
+                match route.deliver(env)? {
+                    super::opencode::Attempt::Delivered(delivered) => return Ok(delivered),
+                    super::opencode::Attempt::Unavailable(note) => {
+                        native_note = format!("{note}. ")
+                    }
+                }
+            }
+        }
         store.deposit_registered(&env.to, env, now_millis())?;
         Ok(Delivered::Queued {
             path: store.path,
-            note: "No native wake-up is available for this route. The recipient must call check_inbox or telephone inbox.".into(),
+            note: format!("{native_note}No native wake-up occurred. The recipient must call check_inbox or telephone inbox."),
         })
     }
 }

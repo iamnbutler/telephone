@@ -1,6 +1,7 @@
 pub mod claude_code;
 pub mod codex;
 pub mod inbox_only;
+pub mod opencode;
 use crate::{
     address::shell_quote,
     envelope::{Envelope, Kind},

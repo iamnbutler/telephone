@@ -68,6 +68,8 @@ pub enum Transport {
     /// Codex's own CLI, which can push a message into a thread's queue even
     /// when that thread isn't currently open.
     CodexQueue,
+    /// An explicitly bound existing OpenCode session; no network discovery.
+    OpenCodeHttp,
     /// The universal fallback: a filesystem inbox the agent drains itself,
     /// via the telephone MCP server or a shell hook.
     Inbox,
@@ -85,6 +87,7 @@ impl std::fmt::Debug for Transport {
                 .field("token", &"[redacted]")
                 .finish(),
             Self::CodexQueue => f.write_str("CodexQueue"),
+            Self::OpenCodeHttp => f.write_str("OpenCodeHttp"),
             Self::Inbox => f.write_str("Inbox"),
         }
     }
@@ -95,6 +98,7 @@ impl Transport {
         match self {
             Transport::ClaudeUds { .. } => "uds",
             Transport::CodexQueue => "queue",
+            Transport::OpenCodeHttp => "http",
             Transport::Inbox => "inbox",
         }
     }

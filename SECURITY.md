@@ -31,6 +31,12 @@ journal is not encrypted and retains message bodies.
 - Inbox fallback means the recipient must poll; it does not wake an agent.
 - OpenCode, Zed, Delta and generic inbox routes require explicit local registration.
   Neither a sender-supplied prefix nor a message to an unknown recipient creates a route.
+- OpenCode optionally binds an address to an authenticated loopback HTTP server
+  and exact existing session/directory. HTTP acceptance is not model receipt.
+  Basic auth authenticates the caller, not the server: the operator must trust
+  the configured listener and other local users. No proxies, redirects, DNS names
+  or remote endpoints are allowed. Credentials come from an owner-only file,
+  never MCP arguments. This route is unsuitable for hostile multi-user machines.
 - Once native delivery may have started, errors do not trigger automatic fallback
   or retry. Check the message ID and outcome before sending again.
 

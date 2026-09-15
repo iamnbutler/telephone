@@ -113,6 +113,27 @@ enum Command {
         address: Option<String>,
     },
 
+    /// Opt into native delivery to an existing, trusted local OpenCode server
+    BindOpencode {
+        #[arg(long)]
+        address: String,
+        /// Canonical http://127.0.0.1:PORT or http://[::1]:PORT; no remote hosts
+        #[arg(long)]
+        endpoint: String,
+        /// Actual OpenCode ses_ ID (not the Telephone address UUID)
+        #[arg(long)]
+        session: String,
+        /// Existing session's absolute directory
+        #[arg(long)]
+        directory: String,
+        /// Owner-only JSON file containing username and password; never pass a token in argv
+        #[arg(long)]
+        credentials: std::path::PathBuf,
+    },
+
+    /// Remove a native binding while retaining the polling inbox
+    UnbindOpencode { address: String },
+
     /// List messageable agents on this machine
     #[command(alias = "ls")]
     List {
@@ -228,6 +249,31 @@ fn run() -> Result<()> {
                     .context("set TELEPHONE_ADDR or supply an address")?,
             };
             store::Store::open(&inbox::root()?)?.unregister(&address.parse()?)
+        }
+        Command::BindOpencode {
+            address,
+            endpoint,
+            session,
+            directory,
+            credentials,
+        } => {
+            let address = address.parse()?;
+            adapters::opencode::address(&address)?;
+            let root = inbox::root()?;
+            store::Store::open(&root)?.registered_identity(&address, envelope::now_millis())?;
+            let route = adapters::opencode::Route {
+                endpoint,
+                session_id: session,
+                directory,
+                credentials,
+            };
+            route.verify()?;
+            store::Store::open(&root)?.bind_opencode(&address, &route)?;
+            writeln!(std::io::stdout().lock(), "Bound {address} to its existing OpenCode session. Native prompts can start model work. HTTP acceptance is not a read receipt; inbox fallback still requires polling.")
+                .context("writing binding result; the binding may already exist")
+        }
+        Command::UnbindOpencode { address } => {
+            store::Store::open(&inbox::root()?)?.unbind_opencode(&address.parse()?)
         }
         Command::List { json, all } => cmd_list(json, all),
         Command::Send {
