@@ -16,7 +16,7 @@ telephone install
 
 [Prebuilt binaries](https://github.com/iamnbutler/telephone/releases/latest) are
 available for macOS and Linux (ARM64 and x86-64). Extract the archive and put
-`telephone` on your PATH. macOS downloads are not notarized.
+`telephone` on your PATH. macOS downloads are Developer ID signed and notarized.
 
 ## Use
 
