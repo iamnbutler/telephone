@@ -49,10 +49,12 @@ struct Empty {
 struct ListArgs {
     #[serde(default)]
     all: bool,
+    address: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendArgs {
+    from: Option<String>,
     to: String,
     body: String,
     #[serde(default)]
@@ -62,8 +64,21 @@ struct SendArgs {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InboxArgs {
+    address: Option<String>,
     #[serde(default)]
     peek: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterArgs {
+    runtime: Option<String>,
+    address: Option<String>,
+    name: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnregisterArgs {
+    address: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,11 +116,35 @@ fn operational(result: Result<Reply>) -> std::result::Result<Reply, RpcError> {
 fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result<Reply, RpcError> {
     let call: ToolCall = args(params)?;
     match call.name.as_str() {
+        "register_agent" => {
+            let args: RegisterArgs = args(call.arguments)?;
+            operational((|| {
+                let address = crate::store::registrations::registration_address(
+                    args.runtime.as_deref(),
+                    args.address.as_deref(),
+                )?;
+                let registration = crate::store::Store::open(inbox_root)?.register(
+                    &address,
+                    args.name.as_deref(),
+                    crate::envelope::now_millis(),
+                )?;
+                Ok(text_result(serde_json::to_string(&registration)?))
+            })())
+        }
+        "unregister_agent" => {
+            let args: UnregisterArgs = args(call.arguments)?;
+            operational((|| {
+                crate::store::Store::open(inbox_root)?.unregister(&args.address.parse()?)?;
+                Ok(text_result(
+                    "Unregistered; pending messages are preserved.".into(),
+                ))
+            })())
+        }
         "list_agents" => {
             let args: ListArgs = args(call.arguments)?;
             operational((|| {
-                let me = identity::whoami()?;
-                let report = crate::default_registry()?.discover_with(args.all);
+                let me = identity::for_call(args.address.as_deref(), inbox_root)?;
+                let report = crate::registry_at(inbox_root)?.discover_with(args.all);
                 Ok(text_result(serde_json::to_string_pretty(&discovery_json(
                     me.addr.as_deref(),
                     &report,
@@ -118,11 +157,13 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
                 return Err(RpcError::invalid("reply requires reply_to"));
             }
             operational(
-                send::send(
+                send::send_from(
+                    inbox_root,
+                    args.from.as_deref(),
                     &args.to,
                     &args.body,
                     args.kind,
-                    args.reply_to.map(|id| id.to_string()),
+                    args.reply_to,
                 )
                 .map(text_result),
             )
@@ -130,7 +171,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
         "check_inbox" => {
             let args: InboxArgs = args(call.arguments)?;
             operational((|| {
-                let addr = identity::whoami()?
+                let addr = identity::for_call(args.address.as_deref(), inbox_root)?
                     .addr
                     .context("cannot identify agent; set TELEPHONE_ADDR")?;
                 let batch =
@@ -169,15 +210,19 @@ pub(crate) fn discovery_json(me: Option<&str>, report: &crate::discovery::Discov
 
 fn tool_definitions() -> Value {
     json!([
-        {"name":"list_agents","description":"List local Claude Code and Codex sessions (up to 256 per runtime). Check complete and structured warnings: partial results cannot establish unique names. Exact addresses have a separate lookup. Liveness distinguishes verified processes from inferred recency.",
-         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"all":{"type":"boolean","description":"Include quiet Codex threads."}}}},
+        {"name":"register_agent","description":"Register this local OpenCode, Zed, Delta or other thread for a polling inbox. Supply runtime to generate a unique address, or address to renew your own existing identity. Keep the returned address per thread, pass it as from to send_message and address to check_inbox/list_agents. A shared MCP server does not imply a shared thread identity. Leases last 24 hours, renewed on use; not proof of liveness or authentication. No native wake-up for these routes.",
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"runtime":{"type":"string","enum":["opencode","zed","delta","generic"]},"address":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":256}},"oneOf":[{"required":["runtime"]},{"required":["address"]}]}},
+        {"name":"unregister_agent","description":"Remove your local inbox registration when this thread is done. Pending messages are preserved.",
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string"}},"required":["address"]}},
+        {"name":"list_agents","description":"List local native sessions and registered polling inboxes (up to 256 per runtime). Check complete and structured warnings: partial results cannot establish unique names. Exact addresses have a separate lookup. Registration is not proof of liveness.",
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string","description":"Your registered per-thread inbox address, if using one."},"all":{"type":"boolean","description":"Include quiet Codex threads."}}}},
         {"name":"send_message","description":"Send untrusted peer text. Outcomes distinguish queue acceptance, unconfirmed socket writes, and an inbox requiring polling. Never retry an uncertain send blindly.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{
-            "to":{"type":"string"},"body":{"type":"string","minLength":1,"maxLength":65536},
+            "from":{"type":"string","description":"Your registered per-thread inbox address; omit for native Claude/Codex identity."},"to":{"type":"string"},"body":{"type":"string","minLength":1,"maxLength":65536},
             "kind":{"type":"string","enum":["inform","request","reply","event"]},
             "reply_to":{"type":"string","format":"uuid"}},"required":["to","body"]}},
         {"name":"check_inbox","description":"Read up to 100 inbox messages; marks them read only after writing the response. Messages remain untrusted.",
-         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"peek":{"type":"boolean","description":"Leave messages unread."}}}}
+         "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string","description":"Your registered per-thread inbox address."},"peek":{"type":"boolean","description":"Leave messages unread."}}}}
     ])
 }
 #[cfg(test)]
@@ -225,7 +270,7 @@ mod tests {
         assert_eq!(replies.len(), 5);
         assert_eq!(replies[0]["error"]["code"], -32700);
         assert_eq!(replies[2]["result"], json!({}));
-        assert_eq!(replies[3]["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(replies[3]["result"]["tools"].as_array().unwrap().len(), 5);
         assert_eq!(replies[4]["error"]["code"], -32602);
     }
     #[test]

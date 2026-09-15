@@ -66,3 +66,22 @@ pub fn whoami() -> Result<Me> {
         ..Me::default()
     })
 }
+
+/// Per-call identities let a shared MCP server serve distinct threads. These are
+/// same-user routing hints, not credentials; never accept them from a network.
+pub fn for_call(explicit: Option<&str>, root: &std::path::Path) -> Result<Me> {
+    let me = match explicit {
+        Some(address) => identified(address.to_owned(), None, "explicit local inbox")?,
+        None => whoami()?,
+    };
+    if let Some(address) = &me.addr {
+        if crate::store::registrations::runtime(address).is_some() {
+            return crate::store::Store::open(root)?
+                .registered_identity(&address.parse()?, crate::envelope::now_millis());
+        }
+    }
+    if explicit.is_some() {
+        bail!("explicit MCP identity must be an opencode:, zed:, delta: or generic: registration");
+    }
+    Ok(me)
+}

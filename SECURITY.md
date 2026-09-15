@@ -29,6 +29,8 @@ journal is not encrypted and retains message bodies.
 - Claude socket writes are **unconfirmed**, not delivery receipts.
 - A successful Codex queue command means **accepted**, not read or acted upon.
 - Inbox fallback means the recipient must poll; it does not wake an agent.
+- OpenCode, Zed, Delta and generic inbox routes require explicit local registration.
+  Neither a sender-supplied prefix nor a message to an unknown recipient creates a route.
 - Once native delivery may have started, errors do not trigger automatic fallback
   or retry. Check the message ID and outcome before sending again.
 
@@ -47,6 +49,18 @@ Current limits: 64 KiB per message body, 1 MiB per MCP request, 100 messages per
 inbox read, and 1,000 unread messages per recipient. Subprocess output is capped
 at 64 KiB per stream. Native operations have deadlines; storage growth still
 needs stronger bounds.
+
+Inbox registrations are owner-local routing hints, not authorization. MCP callers
+may select a registered inbox address per call; processes under the same UID are
+not isolated from each other. Never forward remote-supplied registration or identity
+arguments into these tools. Generated addresses are unique per thread; do not reuse
+an address for an unrelated thread or set one app-wide identity for multiple threads.
+
+There are at most 1,024 active registrations. Each has a 24-hour lease, renewed by
+sender activity or inbox polling, not by incoming messages. Expired records are
+excluded from discovery and pruned on registration. Unregister removes the route,
+not its pending messages. The recipient lease is rechecked under the same SQLite
+writer lock as inbox deposit. Registration always reports inferred liveness.
 
 MCP stdin/stdout must be pipes or sockets. Partial input frames and queued output
 have five-second deadlines, including slow trickle traffic; idle sessions do not
@@ -94,7 +108,6 @@ identity variables require an explicit `TELEPHONE_ADDR`.
 - [Authenticated external sources and per-agent authorization](https://github.com/iamnbutler/telephone/issues/1)
 - [Confirmed receipts, idempotent retries and recovery](https://github.com/iamnbutler/telephone/issues/2)
 - [Retention, global quotas, rate limits and journal inspection](https://github.com/iamnbutler/telephone/issues/3)
-- [Registration for other MCP runtimes](https://github.com/iamnbutler/telephone/issues/4)
 - [Opt-in compatibility tests against real Claude/Codex releases](https://github.com/iamnbutler/telephone/issues/5)
 - [Hard-bounded worker shutdown and diagnostic output](https://github.com/iamnbutler/telephone/issues/11)
 

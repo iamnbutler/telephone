@@ -8,17 +8,28 @@ use crate::{
 use anyhow::{Context, Result};
 
 pub fn send(to: &str, body: &str, kind: Kind, reply_to: Option<String>) -> Result<String> {
-    let me = identity::whoami()?;
-    let from = me
-        .addr
-        .context("cannot identify sender; set TELEPHONE_ADDR explicitly")?;
     let reply_to = reply_to
         .map(|id| uuid::Uuid::parse_str(&id).context("reply_to must be a UUID"))
         .transpose()?;
+    send_from(&crate::inbox::root()?, None, to, body, kind, reply_to)
+}
+
+pub fn send_from(
+    root: &std::path::Path,
+    from: Option<&str>,
+    to: &str,
+    body: &str,
+    kind: Kind,
+    reply_to: Option<uuid::Uuid>,
+) -> Result<String> {
     if kind == Kind::Reply && reply_to.is_none() {
         anyhow::bail!("a reply requires --reply-to");
     }
-    let registry = crate::default_registry()?;
+    let me = identity::for_call(from, root)?;
+    let from = me
+        .addr
+        .context("cannot identify sender; set TELEPHONE_ADDR explicitly or register an inbox")?;
+    let registry = crate::registry_at(root)?;
     let mut discovery = registry.discover();
     let target = registry.resolve(&mut discovery, to).with_context(|| {
         format!(
@@ -33,7 +44,7 @@ pub fn send(to: &str, body: &str, kind: Kind, reply_to: Option<String>) -> Resul
     let adapter = registry
         .adapter_for(&target)
         .context("no adapter for target runtime")?;
-    let mut store = Store::open(&crate::inbox::root()?)?;
+    let mut store = Store::open(root)?;
     let env = store.prepare(draft, reply_to)?;
     let outcome = match adapter.deliver(&target, &env) {
         Ok(outcome) => outcome,

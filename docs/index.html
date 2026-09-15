@@ -39,7 +39,7 @@
 
       <main id="main">
         <h1>Telephone</h1>
-        <p>Telephone is a command-line tool and MCP server for sending messages between coding agents on the same machine. It supports Claude Code and Codex, with a filesystem inbox for runtimes without native delivery.</p>
+        <p>Telephone is a command-line tool and MCP server for sending messages between coding agents on the same machine. Claude Code and Codex have native adapters. OpenCode, Zed and Delta can register polling inboxes.</p>
         <p><strong>Unsafe, experimental software.</strong> Peer messages can lead agents to run commands or change files. Use at your own discretion, on your own machine.</p>
 
         <section id="connect" aria-labelledby="install-title">
@@ -86,13 +86,19 @@ telephone send claude:12345 --kind request \
               <tr><td><code>telephone list</code></td><td>List agents. Add <code>--all</code> or <code>--json</code>.</td></tr>
               <tr><td><code>telephone send &lt;who&gt; &lt;message&gt;</code></td><td>Send a message. Use <code>--kind request</code> to ask for a response, or <code>--kind reply --reply-to &lt;id&gt;</code> to answer one.</td></tr>
               <tr><td><code>telephone inbox</code></td><td>Read queued inbox messages. Add <code>--peek</code> to leave them unread.</td></tr>
+              <tr><td><code>telephone register --runtime delta</code></td><td>Create a per-thread inbox address. Also accepts <code>opencode</code>, <code>zed</code> and <code>generic</code>.</td></tr>
+              <tr><td><code>telephone unregister</code></td><td>Remove your inbox route, preserving queued messages.</td></tr>
               <tr><td><code>telephone whoami</code></td><td>Show the current agent’s address.</td></tr>
               <tr><td><code>telephone doctor</code></td><td>Check discovery and reachability.</td></tr>
               <tr><td><code>telephone mcp</code></td><td>Run the MCP server over stdio.</td></tr>
               <tr><td><code>telephone install</code></td><td>Print runtime setup instructions.</td></tr>
             </tbody>
           </table>
-          <p>Addresses use <code>runtime:local-id</code>. Explicit nicknames and unambiguous IDs also work. The MCP tools are <code>list_agents</code>, <code>send_message</code>, and <code>check_inbox</code>.</p>
+          <p>Addresses use <code>runtime:local-id</code>. Explicit nicknames and unambiguous IDs also work. MCP provides <code>list_agents</code>, <code>send_message</code>, <code>check_inbox</code>, <code>register_agent</code> and <code>unregister_agent</code>.</p>
+          <pre tabindex="0" aria-label="Register a polling inbox"><code>export TELEPHONE_ADDR="$(telephone register --runtime delta)"
+telephone send claude:12345 --kind request "Review my plan and reply."
+telephone inbox</code></pre>
+          <p>Keep one address per thread. Over MCP, call <code>register_agent</code> with <code>runtime</code>, then pass its address as <code>from</code> to send and <code>address</code> to check the inbox. Leases expire after 24 hours without use; polling does not wake an idle agent. All participants must share a machine and OS account.</p>
         </section>
 
         <section id="delivery" aria-labelledby="delivery-title">
@@ -102,6 +108,7 @@ telephone send claude:12345 --kind request \
             <tbody>
               <tr><td>Claude Code</td><td>Native peer socket. Messages enter the running session.</td></tr>
               <tr><td>Codex</td><td>Native queue, when available. A message may wait for the current turn to finish.</td></tr>
+              <tr><td>OpenCode, Zed, Delta</td><td>Explicitly registered polling inbox; no native wake-up.</td></tr>
               <tr><td>Fallback</td><td>Filesystem inbox. The agent must call <code>check_inbox</code> or run <code>telephone inbox</code> to read it.</td></tr>
             </tbody>
           </table>

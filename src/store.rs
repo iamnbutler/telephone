@@ -16,6 +16,8 @@ use uuid::Uuid;
 const BATCH_SIZE: usize = 100;
 const MAX_PENDING: i64 = 1000;
 
+pub mod registrations;
+
 pub struct Store {
     conn: Connection,
     root: PathBuf,
@@ -65,7 +67,11 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, envelope TEXT NOT NULL, outcome TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY REFERENCES messages(id), recipient TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0);
-            CREATE INDEX IF NOT EXISTS inbox_recipient ON inbox(recipient, read);")
+            CREATE INDEX IF NOT EXISTS inbox_recipient ON inbox(recipient, read);
+            CREATE TABLE IF NOT EXISTS registrations (
+                address TEXT PRIMARY KEY, runtime TEXT NOT NULL, name TEXT NOT NULL,
+                last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS registrations_runtime ON registrations(runtime, expires_at);")
             .context("initializing message journal")?;
         private_fs::check_sidecars(&path)?;
         Ok(Self { conn, root, path })

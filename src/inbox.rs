@@ -18,5 +18,10 @@ pub fn deposit(addr: &str, env: &Envelope) -> Result<PathBuf> {
     Ok(store.path)
 }
 pub fn read(addr: &str, peek: bool) -> Result<InboxBatch> {
-    Store::open(&root()?)?.inbox(&addr.parse()?, peek)
+    let address = addr.parse()?;
+    let mut store = Store::open(&root()?)?;
+    if crate::store::registrations::runtime(addr).is_some() {
+        store.registered_identity(&address, crate::envelope::now_millis())?;
+    }
+    store.inbox(&address, peek)
 }

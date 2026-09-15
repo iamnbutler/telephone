@@ -1,6 +1,6 @@
 # telephone
 
-CLI and MCP server for messaging between local Claude Code and Codex sessions.
+CLI and MCP server for messaging between local coding agents.
 
 **Unsafe, experimental software.** Peer messages can lead agents to run commands
 or change files. Use at your own discretion, on your own machine.
@@ -50,3 +50,26 @@ quiet threads. Listings are capped; exact addresses use a separate lookup.
 If discovery is incomplete, Telephone reports it and refuses short-name routing.
 
 See `telephone --help` and [security and upgrade notes](SECURITY.md).
+
+## OpenCode, Zed, Delta and other harnesses
+
+Register once per thread, keeping the returned address for later calls:
+
+```sh
+export TELEPHONE_ADDR="$(telephone register --runtime delta --name reviewer)"
+telephone send claude:12345 --kind request "Review my plan and reply."
+telephone inbox
+telephone unregister
+```
+
+Use `opencode`, `zed`, `delta` or `generic` as the runtime. If you already set
+`TELEPHONE_ADDR`, run `telephone register` before sending.
+
+Over MCP, call `register_agent` with `runtime`; keep its returned `address` per
+thread. Pass it as `from` to `send_message` and `address` to `check_inbox` or
+`list_agents`. Call `unregister_agent` when done.
+
+These routes require polling; they do not wake the agent. Registrations expire
+after 24 hours without use. Sending and checking the inbox renew an active lease;
+`telephone register` renews an expired one. Registration is not proof of liveness
+or identity. All participants must use the same machine and OS account.
