@@ -81,6 +81,45 @@ fn cli_registration_teaches_polling_without_changing_address_only_stdout() {
 }
 
 #[test]
+fn doctor_reports_configured_routes_without_claiming_or_probing_reachability() {
+    let home = tempfile::tempdir().unwrap();
+    let registered = success(home.path(), None, &["register", "--runtime", "opencode"]);
+    let address = registered.trim();
+    // Seed persisted configuration, not a fake HTTP response. There is no server
+    // accepting requests and no credential file; discovery must not require either.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let route = serde_json::json!({
+        "endpoint": format!("http://{}", listener.local_addr().unwrap()),
+        "session_id": "ses_doctor_test",
+        "directory": home.path(),
+        "credentials": home.path().join("absent-credentials.json"),
+    });
+    let db = rusqlite::Connection::open(home.path().join(".telephone/messages.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO opencode_routes(address,route) VALUES (?1,?2)",
+        rusqlite::params![address, route.to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let output = success(home.path(), Some(address), &["doctor"]);
+    let line = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("opencode "))
+        .unwrap();
+    assert!(line.contains("1 native route(s) configured"), "{output}");
+    assert!(line.contains("0 confirmed live"), "{output}");
+    assert!(!output.contains("reachable natively"), "{output}");
+    assert!(output.contains("not proof of reachability or receipt"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "doctor must not probe a configured OpenCode endpoint"
+    );
+}
+
+#[test]
 fn separate_cli_processes_exchange_replies_for_each_registered_runtime() {
     use serde_json::Value;
     let home = tempfile::tempdir().unwrap();
