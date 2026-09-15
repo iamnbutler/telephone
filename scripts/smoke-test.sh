@@ -11,4 +11,4 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"ping"}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/list"}' |
-  "$binary" mcp | jq -se 'length == 3 and .[1].result == {} and (.[2].result.tools | map(.name) | sort == ["check_inbox", "list_agents", "send_message"])' >/dev/null
+  "$binary" mcp | jq -se 'length == 3 and .[1].result == {} and (.[2].result.tools | map(.name) | sort == ["check_inbox", "list_agents", "register_agent", "send_message", "unregister_agent"])' >/dev/null

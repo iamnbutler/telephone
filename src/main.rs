@@ -65,10 +65,15 @@ fn console_text(value: &str) -> String {
 
 /// Every adapter telephone knows about, in preference order.
 pub fn default_registry() -> Result<Registry> {
-    let adapters: Vec<Box<dyn Adapter>> = vec![
+    registry_at(&inbox::root()?)
+}
+
+fn registry_at(root: &std::path::Path) -> Result<Registry> {
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![
         Box::new(adapters::claude_code::ClaudeCode::new()?),
         Box::new(adapters::codex::Codex::new()?),
     ];
+    adapters.extend(adapters::inbox_only::adapters(root));
     Ok(Registry::new(adapters))
 }
 
@@ -85,6 +90,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Register a pollable inbox for an OpenCode, Zed, Delta or other thread
+    Register {
+        /// Generate a unique address for this runtime
+        #[arg(long, value_parser = store::registrations::RUNTIMES, conflicts_with = "address")]
+        runtime: Option<String>,
+        /// Register or renew this exact address (defaults to TELEPHONE_ADDR)
+        #[arg(long)]
+        address: Option<String>,
+        /// Optional display name (not a unique identifier)
+        #[arg(long)]
+        name: Option<String>,
+        /// Include lease timestamps as JSON; otherwise print just the address
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop routing new messages to a registered inbox; preserve its messages
+    Unregister {
+        /// Defaults to your current identity
+        address: Option<String>,
+    },
+
     /// List messageable agents on this machine
     #[command(alias = "ls")]
     List {
@@ -146,6 +173,46 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Register {
+            runtime,
+            address,
+            name,
+            json,
+        } => {
+            let mut address = address;
+            let mut name = name;
+            if runtime.is_none() && address.is_none() {
+                let me = identity::whoami()?;
+                address = me.addr;
+                name = name.or(me.name);
+            }
+            let address =
+                store::registrations::registration_address(runtime.as_deref(), address.as_deref())?;
+            let registration = store::Store::open(&inbox::root()?)?.register(
+                &address,
+                name.as_deref(),
+                envelope::now_millis(),
+            )?;
+            let output = if json {
+                serde_json::to_string(&registration)?
+            } else {
+                registration.address.to_string()
+            };
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{output}").context("writing registration; it may already exist")?;
+            stdout
+                .flush()
+                .context("flushing registration; it may already exist")
+        }
+        Command::Unregister { address } => {
+            let address = match address {
+                Some(a) => a,
+                None => identity::whoami()?
+                    .addr
+                    .context("set TELEPHONE_ADDR or supply an address")?,
+            };
+            store::Store::open(&inbox::root()?)?.unregister(&address.parse()?)
+        }
         Command::List { json, all } => cmd_list(json, all),
         Command::Send {
             to,
@@ -416,7 +483,15 @@ fn cmd_install() -> Result<()> {
     println!("  [mcp_servers.telephone]");
     println!("  command = {}", serde_json::to_string(&exe)?);
     println!("  args = [\"mcp\"]\n");
-    println!("Only Claude Code and Codex are currently discoverable.");
+    println!("OpenCode, Zed, Delta and other local harnesses: run this as a stdio MCP server:\n");
+    println!("  {} mcp\n", address::shell_quote(&exe));
+    println!("Call register_agent with runtime opencode, zed, delta or generic once per thread.");
+    println!(
+        "Keep its returned address; pass it as from to send_message and address to check_inbox."
+    );
+    println!("These inbox routes require polling; they do not wake a thread.");
+    println!("CLI: export TELEPHONE_ADDR=\"$(telephone register --runtime delta)\"");
+    println!("Leases expire after 24 hours without a send or inbox check. Use unregister when finished.\n");
     println!("If it can't tell you which agent it is, set TELEPHONE_ADDR in its");
     println!("environment (see `telephone whoami`).");
     Ok(())
