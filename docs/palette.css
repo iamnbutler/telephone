@@ -1,0 +1,75 @@
+/* If you end up using this, consider donating: https://ko-fi.com/colorparrot — thanks, David Aerne */
+
+:root {
+  --orangecrush-50: #f8ecdf;
+  --orangecrush-100: #f8e8d9;
+  --orangecrush-200: #f5dcc4;
+  --orangecrush-300: #f2c39e;
+  --orangecrush-400: #f0a069;
+  --orangecrush-500: #ee7a37;
+  --orangecrush-600: #ee5f1a;
+  --orangecrush-700: #d45418;
+  --orangecrush-800: #a1451b;
+  --orangecrush-900: #64331d;
+  --orangecrush-950: #32231d;
+
+  --buzz-50: #f8ede1;
+  --buzz-100: #f7ecdd;
+  --buzz-200: #f5e7cf;
+  --buzz-300: #f3deb3;
+  --buzz-400: #f0d185;
+  --buzz-500: #f0c24a;
+  --buzz-600: #f1b316;
+  --buzz-700: #d89311;
+  --buzz-800: #a46918;
+  --buzz-900: #64411b;
+  --buzz-950: #31261c;
+
+  --vitality-50: #f6ece0;
+  --vitality-100: #f2e9dc;
+  --vitality-200: #e7dfcc;
+  --vitality-300: #d1ccaf;
+  --vitality-400: #b1b585;
+  --vitality-500: #8ea05b;
+  --vitality-600: #70943f;
+  --vitality-700: #618238;
+  --vitality-800: #4e6531;
+  --vitality-900: #384328;
+  --vitality-950: #25271f;
+
+  --heavenlysky-50: #f6ece2;
+  --heavenlysky-100: #f2eae0;
+  --heavenlysky-200: #e7e1da;
+  --heavenlysky-300: #cdcfce;
+  --heavenlysky-400: #a2b2bc;
+  --heavenlysky-500: #688fa8;
+  --heavenlysky-600: #327196;
+  --heavenlysky-700: #326979;
+  --heavenlysky-800: #365957;
+  --heavenlysky-900: #2e3f38;
+  --heavenlysky-950: #222623;
+
+  --mutedpurple-50: #f6ebe1;
+  --mutedpurple-100: #f3e6dc;
+  --mutedpurple-200: #e7d5cf;
+  --mutedpurple-300: #cfb6b7;
+  --mutedpurple-400: #a98a9c;
+  --mutedpurple-500: #7d5f8a;
+  --mutedpurple-600: #5c4588;
+  --mutedpurple-700: #513e7b;
+  --mutedpurple-800: #443660;
+  --mutedpurple-900: #332b40;
+  --mutedpurple-950: #242126;
+
+  --redstone-50: #f8ece1;
+  --redstone-100: #f8e9dd;
+  --redstone-200: #f5ded2;
+  --redstone-300: #f1c6ba;
+  --redstone-400: #ea9e96;
+  --redstone-500: #e16c6a;
+  --redstone-600: #d64048;
+  --redstone-700: #b2394a;
+  --redstone-800: #803548;
+  --redstone-900: #4d2b38;
+  --redstone-950: #292025;
+}
