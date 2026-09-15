@@ -6,6 +6,9 @@ This does not configure or restart OpenCode for you.
 
 ## Set up
 
+This is separate from MCP setup. MCP provides tools and a registered polling
+inbox; a native binding lets the owning server deliver a prompt without polling.
+
 Use a local OpenCode server you control, bound to loopback with
 `OPENCODE_SERVER_PASSWORD` set. Keep its endpoint, existing `ses_...` session ID
 and exact session directory. Starting another `opencode serve` does not attach
@@ -58,6 +61,33 @@ Unregistering or expiration followed by re-registration also removes the native
 binding. Unbinding does not cancel a request already in flight. No binding tool
 is exposed through MCP; endpoint configuration is an explicit local CLI action.
 
+## Desktop setup
+
+OpenCode Desktop 1.18.31 owns an authenticated local server and generates its
+credentials per launch. A separately installed CLI can be a different version;
+starting `opencode serve` does not attach to Desktop's session. Do not start an
+older CLI against Desktop's data to work around this.
+
+Our desktop test used an explicitly authorized shell inside the disposable
+thread to save its own inherited server credentials to a new private file
+(directory `0700`, file `0600`). The operator supplied the known loopback endpoint.
+Read-only requests identified the exact session using a unique setup message
+and its directory before binding. The native session ID was not available in
+the agent's initial context. Never pick the newest session or match on directory
+alone; several threads can share it.
+
+This was a manual test bootstrap, not automatic setup or a stable credential
+export API. Do not dump environment variables, print credentials, scrape other
+processes or send passwords through Telephone. If you cannot obtain the owning
+server's credentials and exact session safely, use polling. Easier opt-in
+Desktop onboarding is tracked in [#34](https://github.com/iamnbutler/telephone/issues/34).
+
+After Desktop restarts, verify its endpoint and credentials and repeat the
+binding. An obsolete endpoint or rejected credential can fall back before POST;
+a missing/unsafe credential file fails visibly. Telephone does not automatically
+refresh Desktop credentials. Unbind unused routes and remove their credential
+files when finished.
+
 ## Outcomes and limits
 
 - `http` in discovery means configured, not reachable or verified live.
@@ -93,6 +123,27 @@ TELEPHONE_TEST_OPENCODE=/absolute/path/to/opencode \
   cargo test --locked real_opencode_accepts -- --ignored --nocapture
 ```
 
-This verifies transport compatibility, not a model-driven wake-up. Before release,
-test one harmless request in a disposable real client thread without polling,
-then a request while that thread is busy. Do not test against unrelated live work.
+This automated test verifies transport compatibility, not a model-driven wake-up.
+
+### Desktop acceptance test
+
+On 2026-09-15, the merged native implementation (`3ed62ea`) was tested against
+OpenCode Desktop 1.18.31 on macOS ARM64 in one disposable thread. The recorded
+`build` agent and `openai` / `gpt-6-astra` model selection were preserved.
+
+| Case | Observed result |
+| --- | --- |
+| Idle | Native prompt woke the thread; one matching nonce reply, no inbox polling. |
+| Busy | Prompt arrived during a foreground `sleep 45`; the tool finished normally after 45.038 seconds, then one matching reply was sent. |
+| Unbound | Message stayed unread in the inbox and the thread stayed idle. A separate operator prompt triggered one MCP inbox poll and one matching reply. |
+
+Reply IDs and nonces were checked against the local journal and the actual
+OpenCode tool calls. Neither native test created an inbox copy. The fallback
+message was marked read, and the native binding was restored afterward.
+The operator poll prompt was submitted directly to OpenCode's HTTP API; the
+fallback message itself was retrieved only through Telephone's inbox.
+
+These results do not establish TUI behavior, restart recovery, unsent model/mode
+selection preservation or support for future Desktop versions. Repeat the idle,
+busy and fallback checks after relevant client/transport changes. Use a
+disposable thread, never unrelated live work.
