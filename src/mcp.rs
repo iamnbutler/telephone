@@ -71,7 +71,7 @@ struct InboxArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterArgs {
-    runtime: Option<String>,
+    runtime: Option<crate::runtime::InboxRuntime>,
     address: Option<String>,
     name: Option<String>,
 }
@@ -120,7 +120,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
             let args: RegisterArgs = args(call.arguments)?;
             operational((|| {
                 let address = crate::store::registrations::registration_address(
-                    args.runtime.as_deref(),
+                    args.runtime,
                     args.address.as_deref(),
                 )?;
                 let registration = crate::store::Store::open(inbox_root)?.register(
@@ -148,7 +148,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
                 let me = identity::for_call(args.address.as_deref(), inbox_root)?;
                 let report = crate::registry_at(inbox_root)?.discover_with(args.all);
                 Ok(text_result(serde_json::to_string_pretty(&discovery_json(
-                    me.addr.as_deref(),
+                    me.addr.as_ref().map(crate::address::Address::as_str),
                     &report,
                 ))?))
             })())
@@ -176,8 +176,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
                 let addr = identity::for_call(args.address.as_deref(), inbox_root)?
                     .addr
                     .context("cannot identify agent; set TELEPHONE_ADDR")?;
-                let batch =
-                    crate::store::Store::open(inbox_root)?.inbox(&addr.parse()?, args.peek)?;
+                let batch = crate::store::Store::open(inbox_root)?.inbox(&addr, args.peek)?;
                 let messages: Vec<_> = batch
                     .messages
                     .iter()
@@ -198,10 +197,10 @@ pub(crate) fn discovery_json(me: Option<&str>, report: &crate::discovery::Discov
     let listed: Vec<_> = report
         .agents
         .iter()
-        .filter(|a| Some(a.addr.as_str()) != me)
+        .filter(|a| Some(a.addr()) != me)
         .map(|a| {
             json!({
-                "address":a.addr,"name":a.name,"runtime":a.runtime,"status":a.status.as_str(),
+                "address":a.addr(),"name":a.name,"runtime":a.runtime(),"status":a.status.as_str(),
                 "liveness":a.liveness.as_str(),"cwd":a.cwd.as_ref().map(|c|c.display().to_string()),
                 "transport":a.transports.first().map(|t|t.label())
             })

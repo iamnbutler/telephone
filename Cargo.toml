@@ -10,6 +10,7 @@ include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "do
 
 [dependencies]
 anyhow = "1"
+thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 serde = { version = "1", features = ["derive"] }

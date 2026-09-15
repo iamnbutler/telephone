@@ -63,6 +63,7 @@ use crate::discovery::{self, Budget, Code, Discovery, MAX_AGENTS};
 use crate::envelope::Envelope;
 use crate::inbox;
 use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
+use crate::{address::Address, runtime::Runtime};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
@@ -71,7 +72,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RUNTIME: &str = "codex";
+const RUNTIME: Runtime = Runtime::Codex;
 
 /// How recently a thread must have been touched for us to list it.
 ///
@@ -343,7 +344,7 @@ impl Codex {
                 Err(e) => report.warn(RUNTIME, failure_code, Some(&path), format!("{e:#}")),
             }
         }
-        report.agents.sort_by(|a, b| a.addr.cmp(&b.addr));
+        report.agents.sort_by(|a, b| a.addr().cmp(b.addr()));
     }
 }
 
@@ -380,23 +381,22 @@ fn build_agent(
     } else {
         format!("codex-{}", slugify(label))
     };
-    Ok(Agent {
-        addr: address.to_string(),
-        runtime: RUNTIME,
+    Agent::new(
+        address,
         name,
-        cwd: cwd.map(PathBuf::from),
+        cwd.map(PathBuf::from),
         // Recency cannot distinguish a running thread from one that exited
         // just after its last write, so status stays unknown and liveness
         // stays inferred. See the note on liveness at the top of this module.
-        status: Status::Unknown,
-        liveness: Liveness::Inferred,
+        Status::Unknown,
+        Liveness::Inferred,
         last_seen,
-        transports: if native {
+        if native {
             vec![Transport::CodexQueue, Transport::Inbox]
         } else {
             vec![Transport::Inbox]
         },
-    })
+    )
 }
 
 /// Nicknames are free text. Names are for typing at a shell, so keep them
@@ -428,7 +428,7 @@ fn now_millis() -> u64 {
 }
 
 impl Adapter for Codex {
-    fn runtime(&self) -> &'static str {
+    fn runtime(&self) -> Runtime {
         RUNTIME
     }
 
@@ -449,24 +449,20 @@ impl Adapter for Codex {
         self.discover_since(0, None)
     }
 
-    fn find_exact(&self, address: &str) -> Result<Discovery> {
-        let address: crate::address::Address = address.parse()?;
-        let id = address
-            .as_str()
-            .strip_prefix("codex:")
-            .context("not a Codex address")?;
+    fn find_exact(&self, address: &Address) -> Result<Discovery> {
+        if address.runtime()? != RUNTIME {
+            anyhow::bail!("wrong runtime for codex adapter");
+        }
+        let id = address.local_id();
         self.discover_since(0, Some(id))
     }
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
         env.validate()?;
-        if env.to.as_str() != agent.addr {
+        if agent.runtime() != RUNTIME || &env.to != agent.address() {
             anyhow::bail!("Codex target does not match envelope recipient");
         }
-        let thread = agent
-            .addr
-            .strip_prefix("codex:")
-            .context("invalid Codex address")?;
+        let thread = agent.address().local_id();
         if let Some(cli) = codex_cli() {
             // Capability probing is read-only. A missing/unsupported command is
             // safe to fall back from; an actual send failure is not.
@@ -483,7 +479,7 @@ impl Adapter for Codex {
                 }
             }
         }
-        let path = inbox::deposit(&agent.addr, env)?;
+        let path = inbox::deposit(agent.address(), env)?;
         Ok(Delivered::Queued {
             path,
             note: "native queue unavailable; recipient must check its Telephone inbox".into(),
@@ -600,7 +596,7 @@ mod tests {
         let mut report = adapter.discover_all().unwrap();
         assert_eq!(report.agents.len(), MAX_AGENTS);
         assert!(!report.complete);
-        assert!(!report.agents.iter().any(|a| a.addr == "codex:thread-0"));
+        assert!(!report.agents.iter().any(|a| a.addr() == "codex:thread-0"));
         let registry = crate::registry::Registry::new(vec![Box::new(adapter)]);
         assert!(
             registry.resolve(&mut report, "thread-599").is_err(),
@@ -610,7 +606,7 @@ mod tests {
             registry
                 .resolve(&mut report, "codex:thread-0")
                 .unwrap()
-                .addr,
+                .addr(),
             "codex:thread-0"
         );
     }
@@ -634,12 +630,12 @@ mod tests {
         assert!(!report.complete);
         let missing = (0..600)
             .map(|i| format!("codex:r{i}"))
-            .find(|addr| !report.agents.iter().any(|a| a.addr == *addr))
+            .find(|addr| !report.agents.iter().any(|a| a.addr() == *addr))
             .unwrap();
-        let exact = adapter.find_exact(&missing).unwrap();
+        let exact = adapter.find_exact(&missing.parse().unwrap()).unwrap();
         assert!(exact.complete);
         assert_eq!(exact.agents.len(), 1);
-        assert_eq!(exact.agents[0].addr, missing);
+        assert_eq!(exact.agents[0].addr(), missing);
     }
 
     #[test]
@@ -736,7 +732,7 @@ mod tests {
         barrier.wait();
         for _ in 0..20 {
             let report = adapter.discover_all().unwrap();
-            assert!(report.agents.iter().any(|a| a.addr == "codex:stable"));
+            assert!(report.agents.iter().any(|a| a.addr() == "codex:stable"));
             assert!(!report.complete);
             assert!(!report.warnings.is_empty());
         }
@@ -759,7 +755,7 @@ mod tests {
         let result = adapter.discover_all();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
         let report = result.unwrap();
-        assert!(report.agents.iter().any(|a| a.addr == "codex:stable"));
+        assert!(report.agents.iter().any(|a| a.addr() == "codex:stable"));
         // Root can read mode-000 directories; ordinary CI users cannot.
         // SAFETY: geteuid has no arguments or caller-owned memory.
         if unsafe { libc::geteuid() } != 0 {
@@ -817,7 +813,7 @@ mod tests {
         };
         let agents = adapter.discover_all().unwrap().agents;
         assert_eq!(
-            agents.iter().map(|a| a.addr.as_str()).collect::<Vec<_>>(),
+            agents.iter().map(|a| a.addr()).collect::<Vec<_>>(),
             vec!["codex:child", "codex:older"]
         );
     }
@@ -837,7 +833,7 @@ mod tests {
             registry
                 .resolve(&mut Discovery::default(), "codex:old")
                 .unwrap()
-                .addr,
+                .addr(),
             "codex:old"
         );
         assert!(registry

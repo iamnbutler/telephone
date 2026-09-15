@@ -21,6 +21,7 @@ use crate::discovery::{self, Budget, Code, Discovery};
 use crate::envelope::Envelope;
 use crate::inbox;
 use crate::registry::{Adapter, Agent, Delivered, Liveness, Status, Transport};
+use crate::{address::Address, runtime::Runtime};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -35,7 +36,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-const RUNTIME: &str = "claude";
+const RUNTIME: Runtime = Runtime::Claude;
 
 /// A `~/.claude/sessions/<pid>.json` record. Extra fields are ignored so a
 /// Claude Code upgrade that adds fields doesn't break discovery.
@@ -211,22 +212,21 @@ impl ClaudeCode {
                 }
             }
             transports.push(Transport::Inbox);
-            let agent = Agent {
-                addr: format!("{RUNTIME}:{}", rec.pid),
-                runtime: RUNTIME,
-                name: rec.name.unwrap_or_else(|| format!("claude-{}", rec.pid)),
-                cwd: rec.cwd.map(PathBuf::from),
-                status: status_from(rec.status.as_deref()),
-                liveness: if crate::proc::positively_alive(rec.pid)
+            let agent = Agent::new(
+                format!("{RUNTIME}:{}", rec.pid).parse()?,
+                rec.name.unwrap_or_else(|| format!("claude-{}", rec.pid)),
+                rec.cwd.map(PathBuf::from),
+                status_from(rec.status.as_deref()),
+                if crate::proc::positively_alive(rec.pid)
                     && crate::proc::start_time_verified(rec.started_at, started.get(&rec.pid))
                 {
                     Liveness::Verified
                 } else {
                     Liveness::Inferred
                 },
-                last_seen: rec.status_updated_at.or(rec.started_at).unwrap_or(0),
+                rec.status_updated_at.or(rec.started_at).unwrap_or(0),
                 transports,
-            };
+            )?;
             if !report.push(agent) {
                 break;
             }
@@ -248,7 +248,7 @@ fn status_from(s: Option<&str>) -> Status {
 }
 
 impl Adapter for ClaudeCode {
-    fn runtime(&self) -> &'static str {
+    fn runtime(&self) -> Runtime {
         RUNTIME
     }
 
@@ -256,12 +256,12 @@ impl Adapter for ClaudeCode {
         self.discover_paths(None)
     }
 
-    fn find_exact(&self, address: &str) -> Result<Discovery> {
-        let address: crate::address::Address = address.parse()?;
+    fn find_exact(&self, address: &Address) -> Result<Discovery> {
+        if address.runtime()? != RUNTIME {
+            anyhow::bail!("wrong runtime for claude adapter");
+        }
         let pid = address
-            .as_str()
-            .strip_prefix("claude:")
-            .context("not a Claude address")?
+            .local_id()
             .parse::<u32>()
             .context("Claude address requires a process id")?;
         self.discover_paths(Some(pid))
@@ -269,7 +269,7 @@ impl Adapter for ClaudeCode {
 
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered> {
         env.validate()?;
-        if env.to.as_str() != agent.addr {
+        if agent.runtime() != RUNTIME || &env.to != agent.address() {
             anyhow::bail!("Claude target does not match envelope recipient");
         }
         for transport in &agent.transports {
@@ -294,7 +294,7 @@ impl Adapter for ClaudeCode {
                 return Ok(Delivered::Unconfirmed { via: "uds" });
             }
         }
-        let path = inbox::deposit(&agent.addr, env)?;
+        let path = inbox::deposit(agent.address(), env)?;
         Ok(Delivered::Queued {
             path,
             note: "native socket unavailable; the session will see this when it \
@@ -433,7 +433,9 @@ mod tests {
             sessions_dir: root.path().to_owned(),
         };
         assert!(!adapter.discover().unwrap().complete);
-        let report = adapter.find_exact(&format!("claude:{pid}")).unwrap();
+        let report = adapter
+            .find_exact(&format!("claude:{pid}").parse().unwrap())
+            .unwrap();
         assert!(report.complete);
         assert_eq!(report.agents.len(), 1);
         assert_eq!(report.agents[0].liveness, Liveness::Inferred);
@@ -543,20 +545,20 @@ mod tests {
         )
         .unwrap();
         env.add_hop(env.from.clone()).unwrap();
-        let agent = Agent {
-            addr: env.to.to_string(),
-            name: "fixture".into(),
-            runtime: "claude",
-            cwd: None,
-            status: Status::Unknown,
-            liveness: Liveness::Inferred,
-            last_seen: 0,
-            transports: vec![Transport::ClaudeUds {
+        let agent = Agent::new(
+            env.to.clone(),
+            "fixture".into(),
+            None,
+            Status::Unknown,
+            Liveness::Inferred,
+            0,
+            vec![Transport::ClaudeUds {
                 socket: path,
                 session_id: "fixture-session".into(),
                 token: Some("0".repeat(32)),
             }],
-        };
+        )
+        .unwrap();
         let adapter = ClaudeCode {
             sessions_dir: temp.path().to_owned(),
         };

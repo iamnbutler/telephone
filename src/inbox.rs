@@ -1,5 +1,6 @@
 //! Filesystem-backed local inbox API; transactional storage lives in store.rs.
 use crate::{
+    address::Address,
     envelope::Envelope,
     store::{InboxBatch, Store},
 };
@@ -11,17 +12,15 @@ pub fn root() -> Result<PathBuf> {
         .context("no home directory")?
         .join(".telephone"))
 }
-pub fn deposit(addr: &str, env: &Envelope) -> Result<PathBuf> {
-    let address = addr.parse()?;
+pub fn deposit(address: &Address, env: &Envelope) -> Result<PathBuf> {
     let mut store = Store::open(&root()?)?;
-    store.deposit(&address, env)?;
+    store.deposit(address, env)?;
     Ok(store.path)
 }
-pub fn read(addr: &str, peek: bool) -> Result<InboxBatch> {
-    let address = addr.parse()?;
+pub fn read(address: &Address, peek: bool) -> Result<InboxBatch> {
     let mut store = Store::open(&root()?)?;
-    if crate::store::registrations::runtime(addr).is_some() {
-        store.registered_identity(&address, crate::envelope::now_millis())?;
+    if address.inbox_runtime().is_some() {
+        store.registered_identity(address, crate::envelope::now_millis())?;
     }
-    store.inbox(&address, peek)
+    store.inbox(address, peek)
 }

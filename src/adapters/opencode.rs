@@ -4,81 +4,108 @@
 use crate::{address::Address, envelope::Envelope, private_fs, registry::Delivered};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::json;
+use std::{path::PathBuf, time::Duration};
+
+mod protocol;
+mod route;
+use protocol::{HttpFailure, Message, MessageInfo, PreflightError, Session, UncertainDelivery};
+pub use route::{Route, RouteConfig};
 
 const RESPONSE_LIMIT: u64 = 256 * 1024;
 
-/// Keep actionable failure classes, never response bodies, URLs or auth headers.
-fn http_error(error: ureq::Error) -> anyhow::Error {
-    use ureq::Error;
-    let detail = match error {
-        Error::Io(error) => format!("I/O {:?}", error.kind()),
-        Error::Timeout(stage) => format!("timeout during {stage:?}"),
-        Error::StatusCode(code) => format!("HTTP {code}"),
-        Error::TooManyRedirects | Error::RedirectFailed => "redirect refused".into(),
-        Error::BodyExceedsLimit(limit) => format!("body exceeds {limit}-byte limit"),
-        Error::Protocol(_) => "invalid HTTP protocol".into(),
-        Error::BadUri(_) | Error::Http(_) => "invalid HTTP request".into(),
-        Error::HostNotFound | Error::ConnectionFailed => "connection failed".into(),
-        other => format!(
-            "unexpected HTTP failure ({:?})",
-            std::mem::discriminant(&other)
-        ),
-    };
-    anyhow::anyhow!("{detail}")
+/// Native OpenCode delivery composes the shared registered inbox.
+pub struct OpenCode {
+    inbox: super::inbox_only::InboxOnly,
+}
+
+impl OpenCode {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            inbox: super::inbox_only::InboxOnly {
+                runtime: crate::runtime::InboxRuntime::OpenCode,
+                root,
+            },
+        }
+    }
+
+    fn enrich(
+        &self,
+        mut report: crate::discovery::Discovery,
+    ) -> Result<crate::discovery::Discovery> {
+        if report.agents.is_empty() {
+            return Ok(report);
+        }
+        let store = crate::store::Store::open(&self.inbox.root)?;
+        let mut warnings = Vec::new();
+        report.agents.retain_mut(|agent| {
+            match store.opencode_route(agent.address()) {
+                Ok(Some(route)) => {
+                    agent
+                        .transports
+                        .insert(0, crate::registry::Transport::OpenCodeHttp);
+                    agent.cwd = Some(route.directory().into());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warnings.push(format!("{}: {error:#}", agent.addr()));
+                    return false;
+                }
+            }
+            true
+        });
+        for warning in warnings {
+            report.warn(
+                crate::runtime::Runtime::OpenCode,
+                crate::discovery::Code::SourceUnavailable,
+                None,
+                warning,
+            );
+        }
+        Ok(report)
+    }
+}
+
+impl crate::registry::Adapter for OpenCode {
+    fn runtime(&self) -> crate::runtime::Runtime {
+        crate::runtime::Runtime::OpenCode
+    }
+    fn discover(&self) -> Result<crate::discovery::Discovery> {
+        self.enrich(self.inbox.discover()?)
+    }
+    fn find_exact(&self, address: &Address) -> Result<crate::discovery::Discovery> {
+        self.enrich(self.inbox.find_exact(address)?)
+    }
+    fn deliver(&self, agent: &crate::registry::Agent, env: &Envelope) -> Result<Delivered> {
+        self.inbox.check_target(agent, env)?;
+        let store = crate::store::Store::open(&self.inbox.root)?;
+        let unavailable = match store.opencode_route(&env.to)? {
+            Some(route) => match route.deliver(env)? {
+                Attempt::Accepted => {
+                    return Ok(Delivered::Accepted {
+                        via: "OpenCode HTTP (processing unconfirmed)",
+                    })
+                }
+                Attempt::Unavailable(reason) => Some(reason),
+                Attempt::Uncertain(error) => return Err(error.into()),
+            },
+            None => None,
+        };
+        let mut result = self.inbox.deliver(agent, env)?;
+        if let (Some(reason), Delivered::Queued { note, .. }) = (unavailable, &mut result) {
+            *note = format!("OpenCode preflight failed before sending: {reason}. {note}");
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Route {
-    pub endpoint: String,
-    pub session_id: String,
-    pub directory: String,
-    pub credentials: PathBuf,
-}
-
 impl Route {
-    pub fn validate(&self) -> Result<()> {
-        let socket: SocketAddr = self
-            .endpoint
-            .strip_prefix("http://")
-            .context("OpenCode endpoint must be http://127.0.0.1:PORT or http://[::1]:PORT")?
-            .parse()
-            .context("OpenCode endpoint must contain only a literal loopback address and port")?;
-        if !socket.ip().is_loopback()
-            || socket.port() == 0
-            || self.endpoint != format!("http://{socket}")
-        {
-            bail!("OpenCode endpoint must be a canonical literal loopback address with a nonzero port");
-        }
-        if !self.session_id.starts_with("ses_")
-            || self.session_id.len() <= 4
-            || self.session_id.len() > 128
-            || !self
-                .session_id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
-        {
-            bail!("invalid OpenCode session ID; use the server's ses_ ID, not a Telephone UUID");
-        }
-        if self.directory.len() > 4096
-            || !std::path::Path::new(&self.directory).is_absolute()
-            || self.directory.chars().any(char::is_control)
-            || !self.credentials.is_absolute()
-        {
-            bail!("OpenCode directory and credential file must be absolute paths; directory must be bounded and contain no controls");
-        }
-        Ok(())
-    }
-
     fn client(&self) -> Result<Client<'_>> {
-        self.validate()?;
-        let raw = private_fs::read_secret(&self.credentials, 8192)
+        let raw = private_fs::read_secret(self.credentials(), 8192)
             .context("reading OpenCode credentials (owner-only JSON file required)")?;
         // Do not include serde diagnostics: unknown fields may contain secrets.
         let credentials: Credentials = serde_json::from_str(&raw).map_err(|_| {
@@ -117,30 +144,29 @@ impl Route {
 
     /// Read-only validation, including proving that the server requires credentials.
     pub fn verify(&self) -> Result<()> {
-        self.client()?.verify()
+        self.client()?.verify().map_err(Into::into)
     }
 
-    pub fn deliver(&self, env: &Envelope) -> Result<Attempt> {
+    fn deliver(&self, env: &Envelope) -> Result<Attempt> {
+        // Credential/configuration errors fail closed, not silently into another transport.
         let client = self.client()?;
-        // No message bytes have been submitted: a failed preflight is safe to queue.
         let context = match client.verify().and_then(|()| client.recorded_context()) {
             Ok(context) => context,
-            Err(error) => {
-                return Ok(Attempt::Unavailable(format!(
-                    "OpenCode preflight failed before sending: {error:#}"
-                )))
-            }
+            Err(error) => return Ok(Attempt::Unavailable(error)),
         };
-        client.prompt(env, &context, false)?;
-        Ok(Attempt::Delivered(Delivered::Accepted {
-            via: "OpenCode HTTP (processing unconfirmed)",
-        }))
+        // Never propagate a POST error with ? into a preflight/fallback branch.
+        Ok(match client.prompt(env, &context, false) {
+            Ok(()) => Attempt::Accepted,
+            Err(error) => Attempt::Uncertain(error),
+        })
     }
 }
 
-pub enum Attempt {
-    Unavailable(String),
-    Delivered(Delivered),
+/// Only Unavailable permits inbox fallback; POST outcomes never do.
+enum Attempt {
+    Unavailable(PreflightError),
+    Accepted,
+    Uncertain(UncertainDelivery),
 }
 
 #[derive(Deserialize)]
@@ -163,99 +189,87 @@ struct PromptContext {
     variant: Option<String>,
 }
 
-fn context_string(value: &Value) -> Result<String> {
-    let value = value
-        .as_str()
-        .context("missing recorded OpenCode agent/model field")?;
+fn context_string(value: String) -> Result<String, PreflightError> {
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-        bail!("invalid recorded OpenCode agent/model field");
+        return Err(PreflightError::InvalidContext);
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 impl Client<'_> {
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.route.endpoint)
+        self.route.url(path)
     }
 
-    fn get(&self, path: &str) -> Result<Value> {
+    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, PreflightError> {
         let mut response = self
             .agent
             .get(self.url(path))
-            .query("directory", &self.route.directory)
+            .query("directory", self.route.directory())
             .header("Authorization", &self.auth)
             .call()
-            .map_err(http_error)
-            .context("OpenCode read-only request failed")?;
+            .map_err(HttpFailure::from)?;
         if response.status().as_u16() != 200 {
-            bail!(
-                "OpenCode read-only request returned HTTP {}",
-                response.status().as_u16()
-            );
+            return Err(HttpFailure::Status(response.status().as_u16()).into());
         }
         let text = response
             .body_mut()
             .with_config()
             .limit(RESPONSE_LIMIT)
             .read_to_string()
-            .map_err(http_error)
-            .context("reading bounded OpenCode response")?;
-        serde_json::from_str(&text).map_err(|_| anyhow::anyhow!("OpenCode returned invalid JSON"))
+            .map_err(HttpFailure::from)?;
+        serde_json::from_str(&text).map_err(|_| PreflightError::InvalidResponse)
     }
 
-    fn verify(&self) -> Result<()> {
+    fn verify(&self) -> Result<(), PreflightError> {
         let response = self
             .agent
             .get(self.url("/global/health"))
             .call()
-            .map_err(http_error)
-            .context("OpenCode authentication probe failed")?;
+            .map_err(HttpFailure::from)?;
         if response.status().as_u16() != 401 {
-            bail!("OpenCode server must require HTTP authentication; refusing an unprotected or unexpected endpoint");
+            return Err(PreflightError::Unprotected);
         }
-        let session = self.get(&format!("/session/{}", self.route.session_id))?;
-        if session["id"] != self.route.session_id || session["directory"] != self.route.directory {
-            bail!("OpenCode session ID or directory does not match its binding");
+        let session: Session = self.get(&format!("/session/{}", self.route.session_id()))?;
+        if session.id != self.route.session_id() || session.directory != self.route.directory() {
+            return Err(PreflightError::SessionMismatch);
         }
-        if !session["time"]["archived"].is_null() {
-            bail!("OpenCode session is archived");
+        if session.time.archived.is_some() {
+            return Err(PreflightError::Archived);
         }
         Ok(())
     }
 
-    fn recorded_context(&self) -> Result<PromptContext> {
-        let messages = self.get(&format!(
+    fn recorded_context(&self) -> Result<PromptContext, PreflightError> {
+        let messages: Vec<Message> = self.get(&format!(
             "/session/{}/message?limit=1",
-            self.route.session_id
+            self.route.session_id()
         ))?;
-        let messages = messages
-            .as_array()
-            .context("invalid OpenCode message listing")?;
-        if messages.len() != 1 {
-            bail!("OpenCode session needs a recorded turn before native delivery");
-        }
-        let info = &messages[0]["info"];
-        if info["sessionID"] != self.route.session_id {
-            bail!("OpenCode message belongs to another session");
-        }
-        let (provider, model) = match info["role"].as_str() {
-            Some("user") => (&info["model"]["providerID"], &info["model"]["modelID"]),
-            Some("assistant") => (&info["providerID"], &info["modelID"]),
-            _ => bail!("unexpected OpenCode message role"),
+        let [message]: [Message; 1] = messages
+            .try_into()
+            .map_err(|_| PreflightError::NoRecordedTurn)?;
+        let (common, model) = match message.info {
+            MessageInfo::User { common, model } | MessageInfo::Assistant { common, model } => {
+                (common, model)
+            }
         };
+        if common.session_id != self.route.session_id() {
+            return Err(PreflightError::MessageSessionMismatch);
+        }
         Ok(PromptContext {
-            agent: context_string(&info["agent"])?,
-            provider: context_string(provider)?,
-            model: context_string(model)?,
-            variant: if info["variant"].is_null() {
-                None
-            } else {
-                Some(context_string(&info["variant"])?)
-            },
+            agent: context_string(common.agent)?,
+            provider: context_string(model.provider)?,
+            model: context_string(model.model)?,
+            variant: common.variant.map(context_string).transpose()?,
         })
     }
 
-    fn prompt(&self, env: &Envelope, context: &PromptContext, no_reply: bool) -> Result<()> {
+    fn prompt(
+        &self,
+        env: &Envelope,
+        context: &PromptContext,
+        no_reply: bool,
+    ) -> Result<(), UncertainDelivery> {
         // Let OpenCode assign its ordered native IDs. Telephone's correlation ID
         // remains in the peer envelope; it is not an OpenCode idempotency token.
         let mut body = json!({"agent":context.agent,"model":{"providerID":context.provider,"modelID":context.model},
@@ -269,16 +283,23 @@ impl Client<'_> {
         if no_reply {
             body["noReply"] = json!(true);
         }
-        let encoded =
-            serde_json::to_string(&body).context("encoding OpenCode message before sending")?;
-        let response = self.agent.post(self.url(&format!("/session/{}/prompt_async", self.route.session_id)))
-            .query("directory", &self.route.directory)
+        // Value is already JSON; encoding it has no application-level failure path.
+        let encoded = body.to_string();
+        let response = self
+            .agent
+            .post(self.url(&format!(
+                "/session/{}/prompt_async",
+                self.route.session_id()
+            )))
+            .query("directory", self.route.directory())
             .header("Authorization", &self.auth)
             .header("Content-Type", "application/json")
             .send(encoded)
-            .map_err(http_error).context("OpenCode delivery is uncertain after POST began; no fallback or retry was attempted")?;
+            .map_err(|error| UncertainDelivery(HttpFailure::from(error)))?;
         if response.status().as_u16() != 204 {
-            bail!("OpenCode delivery is uncertain after POST returned HTTP {}; no fallback or retry was attempted", response.status().as_u16());
+            return Err(UncertainDelivery(HttpFailure::Status(
+                response.status().as_u16(),
+            )));
         }
         // 204 only accepts asynchronous work. It can fail later; never claim model receipt.
         Ok(())
@@ -286,7 +307,7 @@ impl Client<'_> {
 }
 
 pub fn address(address: &Address) -> Result<()> {
-    if !address.as_str().starts_with("opencode:") {
+    if address.runtime()? != crate::runtime::Runtime::OpenCode {
         bail!("native OpenCode bindings require an opencode: address");
     }
     Ok(())

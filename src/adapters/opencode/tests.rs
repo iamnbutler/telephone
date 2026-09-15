@@ -1,5 +1,6 @@
 use super::*;
 use crate::{envelope::Kind, registry::Adapter, store::Store};
+use serde_json::Value;
 use std::{
     fs,
     io::{Read, Write},
@@ -9,7 +10,7 @@ use std::{
     time::Instant,
 };
 
-fn route(root: &std::path::Path) -> Route {
+fn route_config(root: &std::path::Path) -> RouteConfig {
     let credentials = root.join("credentials.json");
     fs::write(
         &credentials,
@@ -17,12 +18,16 @@ fn route(root: &std::path::Path) -> Route {
     )
     .unwrap();
     fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).unwrap();
-    Route {
+    RouteConfig {
         endpoint: "http://127.0.0.1:12345".into(),
         session_id: "ses_test".into(),
         directory: root.to_str().unwrap().into(),
         credentials,
     }
+}
+
+fn route(root: &std::path::Path) -> Route {
+    Route::try_from(route_config(root)).unwrap()
 }
 
 fn no_model_context() -> PromptContext {
@@ -34,13 +39,35 @@ fn no_model_context() -> PromptContext {
     }
 }
 
+// Consume the request before returning a fault response. Closing a socket with
+// unread request bytes can reset it and mask the response we intend to exercise.
+fn drain_request(stream: &mut std::net::TcpStream) {
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        assert!(headers.len() < 16 * 1024);
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        headers.push(byte[0]);
+    }
+    let length = std::str::from_utf8(&headers)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<u64>().unwrap())
+        .unwrap_or(0);
+    assert!(length <= 64 * 1024);
+    let copied = std::io::copy(&mut stream.take(length), &mut std::io::sink()).unwrap();
+    assert_eq!(copied, length);
+}
+
 fn wait_for_message(route: &Route, env: &Envelope) -> Value {
     let started = Instant::now();
     loop {
-        let messages = route
+        let messages: Value = route
             .client()
             .unwrap()
-            .get(&format!("/session/{}/message", route.session_id))
+            .get(&format!("/session/{}/message", route.session_id()))
             .unwrap();
         if let Some(message) = messages.as_array().unwrap().iter().find(|message| {
             message["parts"].as_array().unwrap().iter().any(|part| {
@@ -59,7 +86,7 @@ fn wait_for_message(route: &Route, env: &Envelope) -> Value {
 #[test]
 fn rejects_remote_ambiguous_and_injected_routes() {
     let root = tempfile::tempdir().unwrap();
-    let valid = route(root.path());
+    let valid = route_config(root.path());
     for endpoint in [
         "http://localhost:123",
         "https://127.0.0.1:123",
@@ -74,12 +101,13 @@ fn rejects_remote_ambiguous_and_injected_routes() {
     ] {
         let mut invalid = valid.clone();
         invalid.endpoint = endpoint.into();
-        assert!(invalid.validate().is_err(), "{endpoint}");
+        assert!(serde_json::from_value::<Route>(serde_json::to_value(&invalid).unwrap()).is_err());
+        assert!(Route::try_from(invalid).is_err(), "{endpoint}");
     }
-    assert!(valid.validate().is_ok());
+    assert!(Route::try_from(valid.clone()).is_ok());
     let mut ipv6 = valid.clone();
     ipv6.endpoint = "http://[::1]:12345".into();
-    assert!(ipv6.validate().is_ok());
+    assert!(Route::try_from(ipv6).is_ok());
     for id in [
         "ses_",
         "ses_a/../../x",
@@ -89,15 +117,75 @@ fn rejects_remote_ambiguous_and_injected_routes() {
     ] {
         let mut invalid = valid.clone();
         invalid.session_id = id.into();
-        assert!(invalid.validate().is_err());
+        assert!(serde_json::from_value::<Route>(serde_json::to_value(&invalid).unwrap()).is_err());
+        assert!(Route::try_from(invalid).is_err());
     }
     fs::set_permissions(&valid.credentials, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(valid.client().is_err());
+    assert!(Route::try_from(valid.clone()).unwrap().client().is_err());
     fs::set_permissions(&valid.credentials, fs::Permissions::from_mode(0o600)).unwrap();
     let mut symlink = valid.clone();
     symlink.credentials = root.path().join("link");
     std::os::unix::fs::symlink(&valid.credentials, &symlink.credentials).unwrap();
-    assert!(symlink.client().is_err());
+    assert!(Route::try_from(symlink).unwrap().client().is_err());
+}
+
+#[test]
+fn binding_json_round_trips_without_bypassing_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let config = route_config(root.path());
+    let original = serde_json::to_value(&config).unwrap();
+    let route: Route = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&route).unwrap(), original);
+    fs::set_permissions(&config.credentials, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        route.client().is_err(),
+        "credentials must be checked at use, not only binding"
+    );
+}
+
+#[test]
+fn real_registry_selects_native_adapter_and_rejects_cross_runtime_delivery() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let mut store = Store::open(&state).unwrap();
+    let address: Address = "opencode:registered".parse().unwrap();
+    store
+        .register(&address, None, crate::envelope::now_millis())
+        .unwrap();
+    store.bind_opencode(&address, &route(root.path())).unwrap();
+    let registry = crate::registry::Registry::new(crate::adapters::registered_adapters(&state));
+    let mut report = registry.discover();
+    assert!(report.complete);
+    let agent = registry.resolve(&mut report, address.as_str()).unwrap();
+    assert!(matches!(
+        agent.transports[0],
+        crate::registry::Transport::OpenCodeHttp
+    ));
+    assert_eq!(
+        registry.adapter_for(&agent).unwrap().runtime(),
+        crate::runtime::Runtime::OpenCode
+    );
+
+    let untouched = root.path().join("must-not-be-created");
+    let adapter = OpenCode::new(untouched.clone());
+    assert!(adapter.find_exact(&"zed:wrong".parse().unwrap()).is_err());
+    let mut env = Envelope::new("codex:sender", "zed:wrong", Kind::Request, "test".into()).unwrap();
+    env.add_hop(env.from.clone()).unwrap();
+    let wrong = crate::registry::Agent::new(
+        env.to.clone(),
+        "wrong".into(),
+        None,
+        crate::registry::Status::Unknown,
+        crate::registry::Liveness::Inferred,
+        0,
+        vec![crate::registry::Transport::Inbox],
+    )
+    .unwrap();
+    assert!(adapter.deliver(&wrong, &env).is_err());
+    assert!(
+        !untouched.exists(),
+        "mismatched targets must fail before any I/O"
+    );
 }
 
 #[test]
@@ -112,7 +200,11 @@ fn binding_lifecycle_uses_real_journal_and_preserves_polling() {
         .unwrap();
     store.bind_opencode(&address, &route).unwrap();
     assert_eq!(
-        store.opencode_route(&address).unwrap().unwrap().session_id,
+        store
+            .opencode_route(&address)
+            .unwrap()
+            .unwrap()
+            .session_id(),
         "ses_test"
     );
     store.unbind_opencode(&address).unwrap();
@@ -135,10 +227,11 @@ fn binding_lifecycle_uses_real_journal_and_preserves_polling() {
 fn post_disconnect_and_redirect_are_uncertain_without_retry() {
     for redirect in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let mut route = route(root.path());
+        let mut config = route_config(root.path());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        route.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        config.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let route = Route::try_from(config).unwrap();
         let client = route.client().unwrap();
         // Real TCP fault injection: drop after a request byte or return a redirect.
         let receiver = std::thread::spawn(move || {
@@ -156,10 +249,11 @@ fn post_disconnect_and_redirect_are_uncertain_without_retry() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut byte = [0];
-            stream.read_exact(&mut byte).unwrap();
             if redirect {
+                drain_request(&mut stream);
                 stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/escape\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            } else {
+                stream.read_exact(&mut [0]).unwrap();
             }
             drop(stream);
             std::thread::sleep(Duration::from_millis(100));
@@ -176,6 +270,12 @@ fn post_disconnect_and_redirect_are_uncertain_without_retry() {
         )
         .unwrap();
         let error = client.prompt(&env, &no_model_context(), false).unwrap_err();
+        if redirect {
+            assert!(matches!(
+                error,
+                UncertainDelivery(HttpFailure::Status(307) | HttpFailure::Redirect)
+            ));
+        }
         assert!(error.to_string().contains("uncertain"));
         assert!(!format!("{error:#}").contains("isolated-test-password"));
         receiver.join().unwrap();
@@ -200,25 +300,23 @@ fn malformed_binding_does_not_hide_other_registered_threads() {
         rusqlite::params![bad.as_str(), "invalid-json"],
     )
     .unwrap();
-    let adapter = super::super::inbox_only::InboxOnly {
-        runtime: "opencode",
-        root: state,
-    };
+    let adapter = OpenCode::new(state);
     let report = adapter.discover().unwrap();
     assert!(!report.complete);
     assert_eq!(report.agents.len(), 1);
-    assert_eq!(report.agents[0].addr, good.as_str());
-    assert!(!adapter.find_exact(bad.as_str()).unwrap().complete);
+    assert_eq!(report.agents[0].addr(), good.as_str());
+    assert!(!adapter.find_exact(&bad).unwrap().complete);
 }
 
 #[test]
 fn http_response_headers_body_and_wait_are_bounded() {
     for fault in ["headers", "body", "stall"] {
         let root = tempfile::tempdir().unwrap();
-        let mut route = route(root.path());
+        let mut config = route_config(root.path());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        route.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        config.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let route = Route::try_from(config).unwrap();
         let receiver = std::thread::spawn(move || {
             let start = Instant::now();
             let mut stream = loop {
@@ -237,7 +335,7 @@ fn http_response_headers_body_and_wait_are_bounded() {
             stream
                 .set_write_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
-            stream.read_exact(&mut [0]).unwrap();
+            drain_request(&mut stream);
             let response = match fault {
                 "headers" => format!("HTTP/1.1 200 OK\r\nX-Padding: {}", "a".repeat(17 * 1024)),
                 "body" => format!(
@@ -261,11 +359,26 @@ fn http_response_headers_body_and_wait_are_bounded() {
         let error = route
             .client()
             .unwrap()
-            .get("/session/ses_test")
+            .get::<Value>("/session/ses_test")
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(5));
-        if fault == "stall" {
-            assert!(format!("{error:#}").contains("timeout"));
+        match fault {
+            "headers" => assert!(matches!(
+                error,
+                PreflightError::Http(HttpFailure::HeaderLimit { .. })
+            )),
+            "body" => assert!(
+                matches!(
+                    error,
+                    PreflightError::Http(HttpFailure::BodyLimit(RESPONSE_LIMIT))
+                ),
+                "{error:?}"
+            ),
+            "stall" => assert!(matches!(
+                error,
+                PreflightError::Http(HttpFailure::Timeout(_))
+            )),
+            _ => unreachable!(),
         }
         receiver.join().unwrap();
     }
@@ -347,9 +460,9 @@ impl Server {
 fn real_opencode_accepts_existing_session_and_falls_back_only_before_post() {
     let mut server = Server::start();
     let home = tempfile::tempdir().unwrap();
-    let mut route = route(home.path());
-    route.endpoint = server.endpoint.clone();
-    route.directory = server
+    let mut config = route_config(home.path());
+    config.endpoint = server.endpoint.clone();
+    config.directory = server
         .root
         .path()
         .canonicalize()
@@ -357,26 +470,28 @@ fn real_opencode_accepts_existing_session_and_falls_back_only_before_post() {
         .to_str()
         .unwrap()
         .to_owned();
-    let client = route.client().unwrap();
+    let initial = Route::try_from(config.clone()).unwrap();
+    let client = initial.client().unwrap();
     let mut response = client
         .agent
         .post(client.url("/session"))
         .header("Authorization", &client.auth)
-        .query("directory", &route.directory)
+        .query("directory", &config.directory)
         .header("Content-Type", "application/json")
         .send("{}")
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
     let session: Value =
         serde_json::from_str(&response.body_mut().read_to_string().unwrap()).unwrap();
-    route.session_id = session["id"].as_str().unwrap().to_owned();
+    config.session_id = session["id"].as_str().unwrap().to_owned();
+    let route = Route::try_from(config.clone()).unwrap();
     route.verify().unwrap();
-    let mut wrong = route.clone();
+    let mut wrong = config.clone();
     wrong.session_id = "ses_missing".into();
-    assert!(wrong.verify().is_err());
-    let mut wrong = route.clone();
+    assert!(Route::try_from(wrong).unwrap().verify().is_err());
+    let mut wrong = config.clone();
     wrong.directory.push_str("/other");
-    assert!(wrong.verify().is_err());
+    assert!(Route::try_from(wrong).unwrap().verify().is_err());
     let state = home.path().join("telephone-state");
     let mut store = Store::open(&state).unwrap();
     let address: Address = "opencode:test".parse().unwrap();
@@ -384,11 +499,8 @@ fn real_opencode_accepts_existing_session_and_falls_back_only_before_post() {
         .register(&address, None, crate::envelope::now_millis())
         .unwrap();
     store.bind_opencode(&address, &route).unwrap();
-    let adapter = super::super::inbox_only::InboxOnly {
-        runtime: "opencode",
-        root: state.clone(),
-    };
-    let found = adapter.find_exact(address.as_str()).unwrap();
+    let adapter = OpenCode::new(state.clone());
+    let found = adapter.find_exact(&address).unwrap();
     let agent = &found.agents[0];
     assert_eq!(agent.transports[0].label(), "http");
     let mut env = Envelope::new(

@@ -39,7 +39,7 @@ pub fn send_from(
             discovery.warnings_omitted
         )
     })?;
-    let mut draft = Envelope::new(&from, &target.addr, kind, body.to_owned())?;
+    let mut draft = Envelope::new(from.as_str(), target.addr(), kind, body.to_owned())?;
     draft.from_name = me.name;
     let adapter = registry
         .adapter_for(&target)
@@ -49,7 +49,7 @@ pub fn send_from(
     // The sender's return path does not depend on the recipient's transport or
     // on `kind`: an inform message can still ask for a reply in its body. Advice
     // is conditional on an expected reply, never an instruction to start a loop.
-    let receiving = if crate::store::registrations::runtime(env.from.as_str()).is_some() {
+    let receiving = if env.from.inbox_runtime().is_some() {
         format!(
             "\n\nReceiving replies:\n{}",
             crate::guidance::Polling::new(&env.from).text(Some(env.id))
@@ -91,7 +91,7 @@ pub fn send_from(
     let mut report = format!(
         "{description}\nTo: {} ({})\nMessage id: {}",
         serde_json::json!(target.name),
-        target.addr,
+        target.addr(),
         env.id
     );
     // Delivery has already happened: a bookkeeping error must not masquerade as

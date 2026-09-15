@@ -6,7 +6,6 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 impl Store {
     pub fn bind_opencode(&mut self, address: &Address, route: &Route) -> Result<()> {
         crate::adapters::opencode::address(address)?;
-        route.validate()?;
         let encoded = serde_json::to_string(route).context("encoding OpenCode binding")?;
         if encoded.len() > 16384 {
             bail!("OpenCode binding exceeds size limit");
@@ -48,7 +47,6 @@ impl Store {
         let raw = raw.context("OpenCode binding exceeds size limit")?;
         let route: Route = serde_json::from_str(&raw)
             .map_err(|_| anyhow::anyhow!("invalid OpenCode binding JSON"))?;
-        route.validate()?;
         Ok(Some(route))
     }
 
