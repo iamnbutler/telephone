@@ -1,6 +1,7 @@
 pub mod claude_code;
 pub mod codex;
 pub mod inbox_only;
+pub mod opencode;
 use crate::{
     address::shell_quote,
     envelope::{Envelope, Kind},
@@ -23,9 +24,7 @@ pub fn format_for_delivery(env: &Envelope) -> String {
     };
     // Shared MCP servers need a per-call return identity; their child shell may
     // not have TELEPHONE_ADDR (or may have inherited an unrelated native one).
-    let (identity_prefix, mcp_reply) = if crate::store::registrations::runtime(env.to.as_str())
-        .is_some()
-    {
+    let (identity_prefix, mcp_reply) = if env.to.inbox_runtime().is_some() {
         (
             format!("TELEPHONE_ADDR={} ", shell_quote(env.to.as_str())),
             format!(
@@ -50,6 +49,24 @@ pub fn format_for_delivery(env: &Envelope) -> String {
         env.from, env.kind.as_str(), env.id, env.conversation, env.hop_chain.len(),
         shell_quote(&env.id.to_string()), shell_quote(env.from.as_str())
     )
+}
+
+/// Native integration first; the registered inbox is shared fallback plumbing.
+pub fn registered_adapters(root: &std::path::Path) -> Vec<Box<dyn crate::registry::Adapter>> {
+    use crate::runtime::InboxRuntime;
+    InboxRuntime::ALL
+        .into_iter()
+        .map(|runtime| match runtime {
+            InboxRuntime::OpenCode => Box::new(opencode::OpenCode::new(root.to_owned()))
+                as Box<dyn crate::registry::Adapter>,
+            InboxRuntime::Zed | InboxRuntime::Delta | InboxRuntime::Generic => {
+                Box::new(inbox_only::InboxOnly {
+                    runtime,
+                    root: root.to_owned(),
+                })
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

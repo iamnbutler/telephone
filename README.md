@@ -69,7 +69,9 @@ Over MCP, call `register_agent` with `runtime`; keep its returned `address` per
 thread. Pass it as `from` to `send_message` and `address` to `check_inbox` or
 `list_agents`. Call `unregister_agent` when done.
 
-These routes require polling; they do not wake the agent. Registrations expire
+These routes use polling by default. OpenCode can opt into
+[native delivery to an existing session](docs/opencode-native.md).
+Registrations expire
 after 24 hours without use. Sending and checking the inbox renew an active lease;
 `telephone register` renews an expired one. Registration is not proof of liveness
 or identity. All participants must use the same machine and OS account.

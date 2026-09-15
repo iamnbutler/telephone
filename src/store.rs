@@ -16,6 +16,7 @@ use uuid::Uuid;
 const BATCH_SIZE: usize = 100;
 const MAX_PENDING: i64 = 1000;
 
+pub mod opencode;
 pub mod registrations;
 
 pub struct Store {
@@ -71,7 +72,10 @@ impl Store {
             CREATE TABLE IF NOT EXISTS registrations (
                 address TEXT PRIMARY KEY, runtime TEXT NOT NULL, name TEXT NOT NULL,
                 last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS registrations_runtime ON registrations(runtime, expires_at);")
+            CREATE INDEX IF NOT EXISTS registrations_runtime ON registrations(runtime, expires_at);
+            CREATE TABLE IF NOT EXISTS opencode_routes (
+                address TEXT PRIMARY KEY REFERENCES registrations(address) ON DELETE CASCADE,
+                route TEXT NOT NULL);")
             .context("initializing message journal")?;
         private_fs::check_sidecars(&path)?;
         Ok(Self { conn, root, path })

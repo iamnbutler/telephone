@@ -1,5 +1,5 @@
 //! Bounded discovery with explicit partial results. Diagnostics are data, not logs.
-use crate::registry::Agent;
+use crate::{registry::Agent, runtime::Runtime};
 use serde::Serialize;
 use std::{
     fs,
@@ -25,7 +25,7 @@ pub enum Code {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Warning {
-    pub runtime: &'static str,
+    pub runtime: Runtime,
     pub code: Code,
     pub path: Option<String>,
     pub message: String,
@@ -60,7 +60,7 @@ impl Default for Discovery {
 impl Discovery {
     pub fn warn(
         &mut self,
-        runtime: &'static str,
+        runtime: Runtime,
         code: Code,
         path: Option<&Path>,
         message: impl std::fmt::Display,
@@ -70,7 +70,7 @@ impl Discovery {
     }
     pub fn note(
         &mut self,
-        runtime: &'static str,
+        runtime: Runtime,
         code: Code,
         path: Option<&Path>,
         message: impl std::fmt::Display,
@@ -98,7 +98,11 @@ impl Discovery {
         }
     }
     pub fn push(&mut self, agent: Agent) -> bool {
-        if let Some(old) = self.agents.iter_mut().find(|old| old.addr == agent.addr) {
+        if let Some(old) = self
+            .agents
+            .iter_mut()
+            .find(|old| old.addr() == agent.addr())
+        {
             if agent.last_seen > old.last_seen {
                 *old = agent;
             }
@@ -106,7 +110,7 @@ impl Discovery {
         }
         if self.agents.len() == MAX_AGENTS {
             self.warn(
-                agent.runtime,
+                agent.runtime(),
                 Code::LimitReached,
                 None,
                 "agent limit reached (256); use an exact address",
@@ -133,7 +137,7 @@ impl Budget {
             exhausted: false,
         }
     }
-    pub fn check(&mut self, runtime: &'static str, report: &mut Discovery) -> bool {
+    pub fn check(&mut self, runtime: Runtime, report: &mut Discovery) -> bool {
         if self.exhausted {
             return false;
         }
@@ -149,7 +153,7 @@ impl Budget {
         }
         true
     }
-    fn entry(&mut self, runtime: &'static str, report: &mut Discovery) -> bool {
+    fn entry(&mut self, runtime: Runtime, report: &mut Discovery) -> bool {
         if !self.check(runtime, report) {
             return false;
         }
@@ -176,7 +180,7 @@ pub fn files(
     root: &Path,
     recursive: bool,
     matches: fn(&Path) -> bool,
-    runtime: &'static str,
+    runtime: Runtime,
     budget: &mut Budget,
     report: &mut Discovery,
 ) -> Vec<PathBuf> {

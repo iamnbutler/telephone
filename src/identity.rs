@@ -1,11 +1,11 @@
 //! Identity is a local routing hint, not authentication. Never guess from cwd.
-use crate::address::Address;
+use crate::{address::Address, runtime::Runtime};
 use anyhow::{bail, Context, Result};
 
 #[derive(Debug, Default)]
 pub struct Me {
-    pub addr: Option<String>,
-    pub runtime: Option<String>,
+    pub addr: Option<Address>,
+    pub runtime: Option<Runtime>,
     pub name: Option<String>,
     pub source: &'static str,
 }
@@ -27,9 +27,9 @@ fn identified(value: String, name: Option<String>, source: &'static str) -> Resu
     {
         bail!("invalid TELEPHONE_NAME");
     }
-    let runtime = address.as_str().split_once(':').map(|(r, _)| r.to_owned());
+    let runtime = address.runtime().ok();
     Ok(Me {
-        addr: Some(address.to_string()),
+        addr: Some(address),
         runtime,
         name,
         source,
@@ -75,9 +75,9 @@ pub fn for_call(explicit: Option<&str>, root: &std::path::Path) -> Result<Me> {
         None => whoami()?,
     };
     if let Some(address) = &me.addr {
-        if crate::store::registrations::runtime(address).is_some() {
+        if address.inbox_runtime().is_some() {
             return crate::store::Store::open(root)?
-                .registered_identity(&address.parse()?, crate::envelope::now_millis());
+                .registered_identity(address, crate::envelope::now_millis());
         }
     }
     if explicit.is_some() {

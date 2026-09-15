@@ -30,6 +30,7 @@ mod private_fs;
 mod proc;
 mod process;
 mod registry;
+mod runtime;
 mod send;
 mod store;
 
@@ -74,7 +75,7 @@ fn registry_at(root: &std::path::Path) -> Result<Registry> {
         Box::new(adapters::claude_code::ClaudeCode::new()?),
         Box::new(adapters::codex::Codex::new()?),
     ];
-    adapters.extend(adapters::inbox_only::adapters(root));
+    adapters.extend(adapters::registered_adapters(root));
     Ok(Registry::new(adapters))
 }
 
@@ -94,8 +95,8 @@ enum Command {
     /// Register a pollable inbox for an OpenCode, Zed, Delta or other thread
     Register {
         /// Generate a unique address for this runtime
-        #[arg(long, value_parser = store::registrations::RUNTIMES, conflicts_with = "address")]
-        runtime: Option<String>,
+        #[arg(long, value_enum, conflicts_with = "address")]
+        runtime: Option<runtime::InboxRuntime>,
         /// Register or renew this exact address (defaults to TELEPHONE_ADDR)
         #[arg(long)]
         address: Option<String>,
@@ -112,6 +113,27 @@ enum Command {
         /// Defaults to your current identity
         address: Option<String>,
     },
+
+    /// Opt into native delivery to an existing, trusted local OpenCode server
+    BindOpencode {
+        #[arg(long)]
+        address: String,
+        /// Canonical http://127.0.0.1:PORT or http://[::1]:PORT; no remote hosts
+        #[arg(long)]
+        endpoint: String,
+        /// Actual OpenCode ses_ ID (not the Telephone address UUID)
+        #[arg(long)]
+        session: String,
+        /// Existing session's absolute directory
+        #[arg(long)]
+        directory: String,
+        /// Owner-only JSON file containing username and password; never pass a token in argv
+        #[arg(long)]
+        credentials: std::path::PathBuf,
+    },
+
+    /// Remove a native binding while retaining the polling inbox
+    UnbindOpencode { address: String },
 
     /// List messageable agents on this machine
     #[command(alias = "ls")]
@@ -184,11 +206,10 @@ fn run() -> Result<()> {
             let mut name = name;
             if runtime.is_none() && address.is_none() {
                 let me = identity::whoami()?;
-                address = me.addr;
+                address = me.addr.map(String::from);
                 name = name.or(me.name);
             }
-            let address =
-                store::registrations::registration_address(runtime.as_deref(), address.as_deref())?;
+            let address = store::registrations::registration_address(runtime, address.as_deref())?;
             let registration = store::Store::open(&inbox::root()?)?.register(
                 &address,
                 name.as_deref(),
@@ -225,9 +246,35 @@ fn run() -> Result<()> {
                 Some(a) => a,
                 None => identity::whoami()?
                     .addr
-                    .context("set TELEPHONE_ADDR or supply an address")?,
+                    .context("set TELEPHONE_ADDR or supply an address")?
+                    .into(),
             };
             store::Store::open(&inbox::root()?)?.unregister(&address.parse()?)
+        }
+        Command::BindOpencode {
+            address,
+            endpoint,
+            session,
+            directory,
+            credentials,
+        } => {
+            let address = address.parse()?;
+            adapters::opencode::address(&address)?;
+            let root = inbox::root()?;
+            store::Store::open(&root)?.registered_identity(&address, envelope::now_millis())?;
+            let route = adapters::opencode::Route::try_from(adapters::opencode::RouteConfig {
+                endpoint,
+                session_id: session,
+                directory,
+                credentials,
+            })?;
+            route.verify()?;
+            store::Store::open(&root)?.bind_opencode(&address, &route)?;
+            writeln!(std::io::stdout().lock(), "Bound {address} to its existing OpenCode session. Native prompts can start model work. HTTP acceptance is not a read receipt; inbox fallback still requires polling.")
+                .context("writing binding result; the binding may already exist")
+        }
+        Command::UnbindOpencode { address } => {
+            store::Store::open(&inbox::root()?)?.unbind_opencode(&address.parse()?)
         }
         Command::List { json, all } => cmd_list(json, all),
         Command::Send {
@@ -280,14 +327,14 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
             .iter()
             .map(|a| {
                 serde_json::json!({
-                    "address": a.addr,
+                    "address": a.addr(),
                     "name": a.name,
-                    "runtime": a.runtime,
+                    "runtime": a.runtime(),
                     "status": a.status.as_str(),
                     "liveness": a.liveness.as_str(),
                     "cwd": a.cwd.as_ref().map(|c| c.display().to_string()),
                     "transport": a.transports.first().map(|t| t.label()),
-                    "self": Some(&a.addr) == me.addr.as_ref(),
+                    "self": Some(a.addr()) == me.addr.as_ref().map(address::Address::as_str),
                 })
             })
             .collect();
@@ -307,10 +354,10 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
         .map(|a| console_text(&a.name).len())
         .max()
         .unwrap_or(0);
-    let addr_width = agents.iter().map(|a| a.addr.len()).max().unwrap_or(0);
+    let addr_width = agents.iter().map(|a| a.addr().len()).max().unwrap_or(0);
 
     for a in agents {
-        let is_me = Some(&a.addr) == me.addr.as_ref();
+        let is_me = Some(a.addr()) == me.addr.as_ref().map(address::Address::as_str);
         let marker = if is_me { "*" } else { " " };
         let transport = a.transports.first().map(|t| t.label()).unwrap_or("none");
         let cwd = a
@@ -321,7 +368,7 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
         println!(
             "{marker} {:<name_width$}  {:<addr_width$}  {:<7}  {:<7}  {:<5}  {}",
             console_text(&a.name),
-            a.addr,
+            a.addr(),
             a.status.as_str(),
             a.liveness.as_str(),
             transport,
@@ -405,7 +452,10 @@ fn cmd_doctor() -> Result<()> {
     let me = identity::whoami()?;
     println!(
         "you:        {}",
-        me.addr.clone().unwrap_or_else(|| "unknown".into())
+        me.addr
+            .as_ref()
+            .map(address::Address::as_str)
+            .unwrap_or("unknown")
     );
     println!("via:        {}", me.source);
     println!("inbox root: {}", inbox::root()?.display());

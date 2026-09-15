@@ -71,7 +71,7 @@ struct InboxArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterArgs {
-    runtime: Option<String>,
+    runtime: Option<crate::runtime::InboxRuntime>,
     address: Option<String>,
     name: Option<String>,
 }
@@ -120,7 +120,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
             let args: RegisterArgs = args(call.arguments)?;
             operational((|| {
                 let address = crate::store::registrations::registration_address(
-                    args.runtime.as_deref(),
+                    args.runtime,
                     args.address.as_deref(),
                 )?;
                 let registration = crate::store::Store::open(inbox_root)?.register(
@@ -148,7 +148,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
                 let me = identity::for_call(args.address.as_deref(), inbox_root)?;
                 let report = crate::registry_at(inbox_root)?.discover_with(args.all);
                 Ok(text_result(serde_json::to_string_pretty(&discovery_json(
-                    me.addr.as_deref(),
+                    me.addr.as_ref().map(crate::address::Address::as_str),
                     &report,
                 ))?))
             })())
@@ -176,8 +176,7 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
                 let addr = identity::for_call(args.address.as_deref(), inbox_root)?
                     .addr
                     .context("cannot identify agent; set TELEPHONE_ADDR")?;
-                let batch =
-                    crate::store::Store::open(inbox_root)?.inbox(&addr.parse()?, args.peek)?;
+                let batch = crate::store::Store::open(inbox_root)?.inbox(&addr, args.peek)?;
                 let messages: Vec<_> = batch
                     .messages
                     .iter()
@@ -198,10 +197,10 @@ pub(crate) fn discovery_json(me: Option<&str>, report: &crate::discovery::Discov
     let listed: Vec<_> = report
         .agents
         .iter()
-        .filter(|a| Some(a.addr.as_str()) != me)
+        .filter(|a| Some(a.addr()) != me)
         .map(|a| {
             json!({
-                "address":a.addr,"name":a.name,"runtime":a.runtime,"status":a.status.as_str(),
+                "address":a.addr(),"name":a.name,"runtime":a.runtime(),"status":a.status.as_str(),
                 "liveness":a.liveness.as_str(),"cwd":a.cwd.as_ref().map(|c|c.display().to_string()),
                 "transport":a.transports.first().map(|t|t.label())
             })
@@ -212,7 +211,7 @@ pub(crate) fn discovery_json(me: Option<&str>, report: &crate::discovery::Discov
 
 fn tool_definitions() -> Value {
     json!([
-        {"name":"register_agent","description":"Register this local OpenCode, Zed, Delta or other thread for a polling inbox. Supply runtime to generate a unique address, or address to renew your own existing identity. Keep the returned address per thread, pass it as from to send_message and address to check_inbox/list_agents. Follow the returned receiving instructions: replies do not wake this thread, so poll for expected replies without waiting for a user reminder. A shared MCP server does not imply a shared thread identity. Leases last 24 hours, renewed on use; not proof of liveness or authentication.",
+        {"name":"register_agent","description":"Register this local OpenCode, Zed, Delta or other thread for a polling inbox. Supply runtime to generate a unique address, or address to renew your own existing identity. Keep the returned address per thread, pass it as from to send_message and address to check_inbox/list_agents. Registration alone does not enable native wake-up: follow the returned receiving instructions and poll for expected replies without waiting for a user reminder. A shared MCP server does not imply a shared thread identity. Leases last 24 hours, renewed on use; not proof of liveness or authentication.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"runtime":{"type":"string","enum":["opencode","zed","delta","generic"]},"address":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":256}},"oneOf":[{"required":["runtime"]},{"required":["address"]}]}},
         {"name":"unregister_agent","description":"Remove your local inbox registration when this thread is done. Pending messages are preserved.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string"}},"required":["address"]}},

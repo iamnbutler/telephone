@@ -7,6 +7,7 @@
 
 use crate::discovery::{Code, Discovery};
 use crate::envelope::Envelope;
+use crate::{address::Address, runtime::Runtime};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -68,6 +69,8 @@ pub enum Transport {
     /// Codex's own CLI, which can push a message into a thread's queue even
     /// when that thread isn't currently open.
     CodexQueue,
+    /// An explicitly bound existing OpenCode session; no network discovery.
+    OpenCodeHttp,
     /// The universal fallback: a filesystem inbox the agent drains itself,
     /// via the telephone MCP server or a shell hook.
     Inbox,
@@ -85,6 +88,7 @@ impl std::fmt::Debug for Transport {
                 .field("token", &"[redacted]")
                 .finish(),
             Self::CodexQueue => f.write_str("CodexQueue"),
+            Self::OpenCodeHttp => f.write_str("OpenCodeHttp"),
             Self::Inbox => f.write_str("Inbox"),
         }
     }
@@ -95,6 +99,7 @@ impl Transport {
         match self {
             Transport::ClaudeUds { .. } => "uds",
             Transport::CodexQueue => "queue",
+            Transport::OpenCodeHttp => "http",
             Transport::Inbox => "inbox",
         }
     }
@@ -104,8 +109,8 @@ impl Transport {
 #[derive(Debug, Clone)]
 pub struct Agent {
     /// Canonical address: `<runtime>:<local-id>`, e.g. `claude:83487`.
-    pub addr: String,
-    pub runtime: &'static str,
+    addr: Address,
+    runtime: Runtime,
     /// Display alias. Convenient to type, but never authoritative: names
     /// collide and get reused, addresses don't.
     pub name: String,
@@ -120,15 +125,47 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn new(
+        addr: Address,
+        name: String,
+        cwd: Option<PathBuf>,
+        status: Status,
+        liveness: Liveness,
+        last_seen: u64,
+        transports: Vec<Transport>,
+    ) -> Result<Self> {
+        let runtime = addr.runtime()?;
+        Ok(Self {
+            addr,
+            runtime,
+            name,
+            cwd,
+            status,
+            liveness,
+            last_seen,
+            transports,
+        })
+    }
+
+    pub fn address(&self) -> &Address {
+        &self.addr
+    }
+    pub fn addr(&self) -> &str {
+        self.addr.as_str()
+    }
+    pub fn runtime(&self) -> Runtime {
+        self.runtime
+    }
+
     /// True if `q` names this agent: exact address, exact name, or the
     /// local-id half of the address.
     pub fn matches(&self, q: &str) -> bool {
-        if self.addr == q || self.name == q {
+        if self.addr() == q || self.name == q {
             return true;
         }
         // Allow `83487` as shorthand for `claude:83487`, but only when
         // unambiguous -- the caller is responsible for rejecting multiple hits.
-        self.addr.split_once(':').map(|(_, id)| id) == Some(q)
+        self.addr.local_id() == q
     }
 }
 
@@ -146,7 +183,7 @@ pub enum Delivered {
 
 /// One runtime's integration: how to find its sessions and how to talk to them.
 pub trait Adapter {
-    fn runtime(&self) -> &'static str;
+    fn runtime(&self) -> Runtime;
 
     /// Enumerate live sessions. Should return `Ok(vec![])` rather than erroring
     /// when the runtime simply isn't installed.
@@ -156,7 +193,7 @@ pub trait Adapter {
         self.discover()
     }
 
-    fn find_exact(&self, address: &str) -> Result<Discovery>;
+    fn find_exact(&self, address: &Address) -> Result<Discovery>;
 
     /// Deliver `env` to `agent`, which this adapter produced.
     fn deliver(&self, agent: &Agent, env: &Envelope) -> Result<Delivered>;
@@ -205,7 +242,7 @@ impl Registry {
     pub fn adapter_for(&self, agent: &Agent) -> Option<&dyn Adapter> {
         self.adapters
             .iter()
-            .find(|a| a.runtime() == agent.runtime)
+            .find(|a| a.runtime() == agent.runtime())
             .map(|a| a.as_ref())
     }
 
@@ -213,18 +250,18 @@ impl Registry {
     pub fn resolve(&self, report: &mut Discovery, q: &str) -> Result<Agent> {
         if q.contains(':') {
             let address: crate::address::Address = q.parse()?;
-            if let Some(agent) = report.agents.iter().find(|a| a.addr == address.as_str()) {
+            if let Some(agent) = report.agents.iter().find(|a| a.addr() == address.as_str()) {
                 return Ok(agent.clone());
             }
-            let runtime = q.split_once(':').map(|(r, _)| r).unwrap_or("");
+            let runtime = address.runtime()?;
             let adapter = self
                 .adapters
                 .iter()
                 .find(|a| a.runtime() == runtime)
                 .ok_or_else(|| anyhow::anyhow!("unsupported address runtime"))?;
-            let exact = adapter.find_exact(address.as_str())?;
+            let exact = adapter.find_exact(&address)?;
             let complete = exact.complete;
-            let agent = exact.agents.iter().find(|a| a.addr == q).cloned();
+            let agent = exact.agents.iter().find(|a| a.addr() == q).cloned();
             report.merge(exact);
             return agent.ok_or_else(|| if complete {
                 anyhow::anyhow!("no agent matches this exact address")
@@ -240,7 +277,7 @@ impl Registry {
             0 => anyhow::bail!("no agent matches '{q}' (try `telephone list`)"),
             1 => Ok(hits[0].clone()),
             _ => {
-                let names: Vec<&str> = hits.iter().map(|a| a.addr.as_str()).collect();
+                let names: Vec<&str> = hits.iter().map(|a| a.addr()).collect();
                 anyhow::bail!("'{q}' is ambiguous: {}", names.join(", "))
             }
         }
@@ -252,16 +289,39 @@ mod tests {
     use super::*;
 
     fn agent(addr: &str, name: &str) -> Agent {
-        Agent {
-            addr: addr.into(),
-            runtime: "claude",
-            name: name.into(),
-            cwd: None,
-            status: Status::Idle,
-            liveness: Liveness::Verified,
-            last_seen: 0,
-            transports: vec![Transport::Inbox],
-        }
+        Agent::new(
+            addr.parse().unwrap(),
+            name.into(),
+            None,
+            Status::Idle,
+            Liveness::Verified,
+            0,
+            vec![Transport::Inbox],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_runtime_comes_from_its_address_and_unknown_runtimes_cannot_route() {
+        assert_eq!(agent("claude:1", "a").runtime(), Runtime::Claude);
+        assert_eq!(agent("codex:1", "a").runtime(), Runtime::Codex);
+        assert!(Agent::new(
+            "unknown:1".parse().unwrap(),
+            "a".into(),
+            None,
+            Status::Unknown,
+            Liveness::Inferred,
+            0,
+            vec![Transport::Inbox]
+        )
+        .is_err());
+        let registry = Registry::new(vec![]);
+        let error = registry
+            .resolve(&mut Discovery::default(), "unknown:1")
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::runtime::UnsupportedRuntime>()
+            .is_some());
     }
 
     #[test]
