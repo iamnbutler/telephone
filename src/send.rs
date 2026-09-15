@@ -46,13 +46,27 @@ pub fn send_from(
         .context("no adapter for target runtime")?;
     let mut store = Store::open(root)?;
     let env = store.prepare(draft, reply_to)?;
+    // The sender's return path does not depend on the recipient's transport or
+    // on `kind`: an inform message can still ask for a reply in its body. Advice
+    // is conditional on an expected reply, never an instruction to start a loop.
+    let receiving = if crate::store::registrations::runtime(env.from.as_str()).is_some() {
+        format!(
+            "\n\nReceiving replies:\n{}",
+            crate::guidance::Polling::new(&env.from).text(Some(env.id))
+        )
+    } else {
+        String::new()
+    };
     let outcome = match adapter.deliver(&target, &env) {
         Ok(outcome) => outcome,
         Err(e) => {
             if let Err(journal) = store.outcome(env.id, "failed-or-uncertain") {
-                return Err(e).context(format!("delivery failed or is uncertain; journal update also failed: {journal:#}; message {}", env.id));
+                return Err(e).context(format!("delivery failed or is uncertain; journal update also failed: {journal:#}; message {}{receiving}", env.id));
             }
-            return Err(e).context(format!("message {}; inspect before retrying", env.id));
+            return Err(e).context(format!(
+                "message {}; inspect before retrying{receiving}",
+                env.id
+            ));
         }
     };
     let (state, description) = match outcome {
@@ -96,5 +110,6 @@ pub fn send_from(
             discovery.warnings_omitted
         ));
     }
+    report.push_str(&receiving);
     Ok(report)
 }

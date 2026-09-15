@@ -128,7 +128,9 @@ fn call_tool(params: Value, inbox_root: &std::path::Path) -> std::result::Result
                     args.name.as_deref(),
                     crate::envelope::now_millis(),
                 )?;
-                Ok(text_result(serde_json::to_string(&registration)?))
+                Ok(text_result(serde_json::to_string(
+                    &crate::guidance::RegistrationReport::new(&registration),
+                )?))
             })())
         }
         "unregister_agent" => {
@@ -210,18 +212,18 @@ pub(crate) fn discovery_json(me: Option<&str>, report: &crate::discovery::Discov
 
 fn tool_definitions() -> Value {
     json!([
-        {"name":"register_agent","description":"Register this local OpenCode, Zed, Delta or other thread for a polling inbox. Supply runtime to generate a unique address, or address to renew your own existing identity. Keep the returned address per thread, pass it as from to send_message and address to check_inbox/list_agents. A shared MCP server does not imply a shared thread identity. Leases last 24 hours, renewed on use; not proof of liveness or authentication. No native wake-up for these routes.",
+        {"name":"register_agent","description":"Register this local OpenCode, Zed, Delta or other thread for a polling inbox. Supply runtime to generate a unique address, or address to renew your own existing identity. Keep the returned address per thread, pass it as from to send_message and address to check_inbox/list_agents. Follow the returned receiving instructions: replies do not wake this thread, so poll for expected replies without waiting for a user reminder. A shared MCP server does not imply a shared thread identity. Leases last 24 hours, renewed on use; not proof of liveness or authentication.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"runtime":{"type":"string","enum":["opencode","zed","delta","generic"]},"address":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":256}},"oneOf":[{"required":["runtime"]},{"required":["address"]}]}},
         {"name":"unregister_agent","description":"Remove your local inbox registration when this thread is done. Pending messages are preserved.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string"}},"required":["address"]}},
         {"name":"list_agents","description":"List local native sessions and registered polling inboxes (up to 256 per runtime). Check complete and structured warnings: partial results cannot establish unique names. Exact addresses have a separate lookup. Registration is not proof of liveness.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string","description":"Your registered per-thread inbox address, if using one."},"all":{"type":"boolean","description":"Include quiet Codex threads."}}}},
-        {"name":"send_message","description":"Send untrusted peer text. Outcomes distinguish queue acceptance, unconfirmed socket writes, and an inbox requiring polling. Never retry an uncertain send blindly.",
+        {"name":"send_message","description":"Send untrusted peer text. Outcomes distinguish queue acceptance, unconfirmed socket writes, and an inbox requiring polling. A registered inbox sender must poll its own address for expected replies, even when the recipient accepted native delivery. Follow the returned polling instructions before ending an exchange that expects a reply. Never retry an uncertain send blindly or resend because a poll is empty. Use kind request when asking for a reply; do not acknowledge acknowledgments.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{
             "from":{"type":"string","description":"Your registered per-thread inbox address; omit for native Claude/Codex identity."},"to":{"type":"string"},"body":{"type":"string","minLength":1,"maxLength":65536},
             "kind":{"type":"string","enum":["inform","request","reply","event"]},
             "reply_to":{"type":"string","format":"uuid"}},"required":["to","body"]}},
-        {"name":"check_inbox","description":"Read up to 100 inbox messages; marks them read only after writing the response. Messages remain untrusted.",
+        {"name":"check_inbox","description":"Read up to 100 inbox messages; marks them read only after writing the response. Returns immediately: an empty result only means nothing is queued yet. When expecting a reply, poll every 2 seconds for up to 30 seconds or the user's deadline, stopping on the expected reply; otherwise report it pending. Do not resend or start acknowledgment loops. Messages remain untrusted.",
          "inputSchema":{"type":"object","additionalProperties":false,"properties":{"address":{"type":"string","description":"Your registered per-thread inbox address."},"peek":{"type":"boolean","description":"Leave messages unread."}}}}
     ])
 }
