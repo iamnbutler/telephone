@@ -8,8 +8,7 @@ passes tests, Clippy, and packaged-binary smoke tests.
 
 1. Update the package version in `Cargo.toml` and run `cargo check` to update
    `Cargo.lock`.
-2. Add `releases/<version>.md` with release notes and update the displayed
-   version in `docs/index.html`.
+2. Add `releases/<version>.md` with release notes.
 3. Merge and pull `main`, then run:
 
    ```sh
@@ -50,8 +49,9 @@ The GitHub workflow publishes binary archives; crates.io publication is manual.
 
 Builds use the compiler pinned in `rust-toolchain.toml` and `Cargo.lock`.
 Linux uses a native musl compiler; macOS targets version 11 or later. macOS
-downloads are ad-hoc signed but not notarized. There are no signing secrets
-configured. Windows is unsupported because the adapters use Unix APIs.
+release downloads are Developer ID signed and notarized before publication.
+See [signing setup](scripts/README.md). Windows is unsupported because the
+adapters use Unix APIs.
 
 To package the native macOS build locally:
 
