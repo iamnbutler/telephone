@@ -41,6 +41,13 @@ Native delivery depends on runtime internals. If unavailable before sending,
 messages go to an inbox the receiving agent must check. A socket write is not
 a receipt; Telephone reports uncertainty and does not retry it automatically.
 
+For an active Codex team that polls `telephone inbox`, send with
+`TELEPHONE_CODEX_INBOX=1 telephone send <address> <message>` (or export that
+variable for the session). This chooses the inbox before any native attempt;
+it does not wake an idle thread. The default still uses the native queue when
+available. Native-queued messages are not also copied into the polling inbox.
+See [Codex polling](docs/codex-polling.md).
+
 To reply, use `--kind reply --reply-to <message-id>`. Replies must match a
 message in the local journal; exchanges stop after eight hops.
 

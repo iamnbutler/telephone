@@ -28,6 +28,8 @@ journal is not encrypted and retains message bodies.
 
 - Claude socket writes are **unconfirmed**, not delivery receipts.
 - A successful Codex queue command means **accepted**, not read or acted upon.
+- `TELEPHONE_CODEX_INBOX=1` explicitly selects polling for Codex recipients before
+  any native attempt. It does not replay or duplicate earlier native sends.
 - Inbox fallback means the recipient must poll; it does not wake an agent.
 - OpenCode, Zed, Delta and generic inbox routes require explicit local registration.
   Neither a sender-supplied prefix nor a message to an unknown recipient creates a route.

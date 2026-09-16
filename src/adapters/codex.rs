@@ -482,7 +482,12 @@ impl Adapter for Codex {
         let path = inbox::deposit(agent.address(), env)?;
         Ok(Delivered::Queued {
             path,
-            note: "native queue unavailable; recipient must check its Telephone inbox".into(),
+            note: if prefer_inbox() {
+                "Codex inbox delivery requested; no native wake-up attempted. The recipient must check its Telephone inbox."
+            } else {
+                "native queue unavailable; recipient must check its Telephone inbox"
+            }
+            .into(),
         })
     }
 }
@@ -512,7 +517,17 @@ impl Codex {
 ///
 /// Codex ships inside the ChatGPT desktop app as well as standalone, so an
 /// installed-and-working Codex often isn't on `PATH` at all.
+fn prefer_inbox() -> bool {
+    std::env::var_os("TELEPHONE_CODEX_INBOX").as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
 fn codex_cli() -> Option<PathBuf> {
+    // An active Codex turn may not consume the native queue until it ends. A
+    // team that is already polling can explicitly choose its durable inbox,
+    // before probing or sending anything through the native route.
+    if prefer_inbox() {
+        return None;
+    }
     // Codex sets this in the environment of MCP servers it spawns, which makes
     // it the most reliable source when we're running under Codex ourselves.
     if let Ok(p) = std::env::var("CODEX_CLI_PATH") {

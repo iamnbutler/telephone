@@ -11,6 +11,7 @@ fn isolated(home: &std::path::Path, identity: Option<&str>) -> Command {
         .env_remove("CLAUDE_PID")
         .env_remove("TELEPHONE_ADDR")
         .env_remove("TELEPHONE_NAME")
+        .env_remove("TELEPHONE_CODEX_INBOX")
         .env_remove("CLAUDE_CODE_MESSAGING_SOCKET");
     if let Some(identity) = identity {
         command.env("TELEPHONE_ADDR", identity);
@@ -26,6 +27,87 @@ fn success(home: &std::path::Path, identity: Option<&str>, args: &[&str]) -> Str
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn codex_polling_is_explicit_and_bypasses_native_queue_without_replaying_it() {
+    use std::{fs, os::unix::fs::PermissionsExt, time::SystemTime};
+
+    let home = tempfile::tempdir().unwrap();
+    let codex_home = home.path().join(".codex");
+    fs::create_dir_all(&codex_home).unwrap();
+    let thread = uuid::Uuid::new_v4().to_string();
+    let recipient = format!("codex:{thread}");
+    let conn = rusqlite::Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+    conn.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,cwd TEXT,agent_nickname TEXT,updated_at_ms INTEGER,updated_at INTEGER,archived INTEGER);").unwrap();
+    let at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    conn.execute(
+        "INSERT INTO threads VALUES (?1,?2,'polling-test',?3,?4,0)",
+        rusqlite::params![thread, home.path().to_str().unwrap(), at, at / 1000],
+    )
+    .unwrap();
+    drop(conn);
+
+    let fake_cli = home.path().join("codex-cli");
+    let log = home.path().join("queue.log");
+    fs::write(
+        &fake_cli,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$QUEUE_LOG\"\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_cli, fs::Permissions::from_mode(0o755)).unwrap();
+    let sender = success(home.path(), None, &["register", "--runtime", "delta"]);
+    let sender = sender.trim();
+
+    let native = isolated(home.path(), Some(sender))
+        .env("CODEX_CLI_PATH", &fake_cli)
+        .env("QUEUE_LOG", &log)
+        .args(["send", &recipient, "native message"])
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(String::from_utf8_lossy(&native.stdout).contains("Accepted by codex queue"));
+    let native_log = fs::read(&log).unwrap();
+    assert!(!native_log.is_empty());
+
+    let polling = isolated(home.path(), Some(sender))
+        .env("CODEX_CLI_PATH", &fake_cli)
+        .env("QUEUE_LOG", &log)
+        .env("TELEPHONE_CODEX_INBOX", "1")
+        .args(["send", &recipient, "polling message"])
+        .output()
+        .unwrap();
+    assert!(
+        polling.status.success(),
+        "{}",
+        String::from_utf8_lossy(&polling.stderr)
+    );
+    assert!(String::from_utf8_lossy(&polling.stdout).contains("no native wake-up attempted"));
+    assert_eq!(
+        fs::read(&log).unwrap(),
+        native_log,
+        "polling must not probe or send through the native CLI"
+    );
+
+    let inbox: serde_json::Value = serde_json::from_str(&success(
+        home.path(),
+        Some(&recipient),
+        &["inbox", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(inbox.as_array().unwrap().len(), 1);
+    assert_eq!(inbox[0]["body"], "polling message");
+    assert_eq!(
+        success(home.path(), Some(&recipient), &["inbox", "--json"]).trim(),
+        "[]"
+    );
 }
 
 fn assert_polling_text(text: &str, address: &str) {
