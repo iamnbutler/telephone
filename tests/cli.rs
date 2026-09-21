@@ -7,6 +7,7 @@ fn isolated(home: &std::path::Path, identity: Option<&str>) -> Command {
     command
         .env("HOME", home)
         .env_remove("CODEX_HOME")
+        .env_remove("CODEX_CLI_PATH")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLAUDE_PID")
         .env_remove("TELEPHONE_ADDR")
@@ -376,6 +377,20 @@ fn polling_routes_automatically_expires_and_never_replays_native_messages() {
     let recipient = seed_codex(home.path(), "recipient");
     let cli = fake_codex(home.path());
     let log = home.path().join("queue.log");
+    let doctor = || {
+        let output = isolated(home.path(), None)
+            .env("CODEX_CLI_PATH", &cli)
+            .env("QUEUE_LOG", &log)
+            .args(["doctor", &recipient, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
     let mut command = isolated(home.path(), Some(&sender));
     command.env("CODEX_CLI_PATH", &cli).env("QUEUE_LOG", &log);
     let mut mcp = McpProcess::from_command(command);
@@ -411,26 +426,16 @@ fn polling_routes_automatically_expires_and_never_replays_native_messages() {
     .unwrap();
     assert_eq!(received.as_array().unwrap().len(), 1);
     assert_eq!(received[0]["body"], "automatic");
-    let doctor: Value = serde_json::from_str(&success(
-        home.path(),
-        None,
-        &["doctor", &recipient, "--json"],
-    ))
-    .unwrap();
-    assert_eq!(doctor["preferred_transport"], "inbox");
-    assert_eq!(doctor["native_transport"], "queue");
-    assert!(doctor["polling"]["expires_at"].as_u64().unwrap() > now());
+    let fresh = doctor();
+    assert_eq!(fresh["preferred_transport"], "inbox");
+    assert_eq!(fresh["native_transport"], "queue");
+    assert!(fresh["polling"]["expires_at"].as_u64().unwrap() > now());
     let conn = journal(home.path());
     conn.execute("UPDATE receiving SET checked_at=1,expires_at=2", [])
         .unwrap();
-    let doctor: Value = serde_json::from_str(&success(
-        home.path(),
-        None,
-        &["doctor", &recipient, "--json"],
-    ))
-    .unwrap();
-    assert_eq!(doctor["preferred_transport"], "queue");
-    assert!(doctor["polling"].is_null());
+    let stale = doctor();
+    assert_eq!(stale["preferred_transport"], "queue");
+    assert!(stale["polling"].is_null());
     assert_eq!(
         std::fs::read(&log).unwrap(),
         native_log,
