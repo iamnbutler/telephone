@@ -89,10 +89,8 @@ impl ClaudeCode {
         Ok(key.peer_token)
     }
 
-    /// MCP children do not always receive CLAUDE_PID. Check the direct
-    /// parent's session record before trusting an inherited Codex thread id.
-    pub fn parent_address() -> Result<Option<String>> {
-        let pid = crate::proc::parent_pid();
+    /// Verify an ancestor session before trusting an inherited Codex thread id.
+    pub fn address_for_pid(pid: u32) -> Result<Option<String>> {
         let adapter = Self::new()?;
         let path = adapter.sessions_dir.join(format!("{pid}.json"));
         if !path
@@ -212,7 +210,10 @@ impl ClaudeCode {
                 }
             }
             transports.push(Transport::Inbox);
-            let agent = Agent::new(
+            let session_key = (crate::proc::positively_alive(rec.pid)
+                && crate::proc::start_time_verified(rec.started_at, started.get(&rec.pid)))
+            .then(|| format!("claude:{}:{}", rec.pid, rec.session_id));
+            let mut agent = Agent::new(
                 format!("{RUNTIME}:{}", rec.pid).parse()?,
                 rec.name.unwrap_or_else(|| format!("claude-{}", rec.pid)),
                 rec.cwd.map(PathBuf::from),
@@ -227,6 +228,7 @@ impl ClaudeCode {
                 rec.status_updated_at.or(rec.started_at).unwrap_or(0),
                 transports,
             )?;
+            agent.session_key = session_key;
             if !report.push(agent) {
                 break;
             }

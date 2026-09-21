@@ -27,8 +27,10 @@ mkdir -p target/release-packages
 staging=$(mktemp -d "$repo_root/target/release-packages/staging.XXXXXX")
 install -m 755 "$binary" "$staging/telephone"
 cp README.md SECURITY.md LICENSE "$staging/"
+mkdir "$staging/docs"
+cp docs/{codex-polling,context-management,compatibility}.md "$staging/docs/"
 archive="$repo_root/target/release-packages/telephone-$target.tar.gz"
-COPYFILE_DISABLE=1 tar -czf "$archive" -C "$staging" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$archive" -C "$staging" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 
 # Test the packaged copy, not just the cargo build output.
 extracted=$(mktemp -d "$repo_root/target/release-packages/check.XXXXXX")

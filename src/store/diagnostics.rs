@@ -46,7 +46,6 @@ impl Store {
             let channel = match (inbox_read, recipient.runtime().ok(), outcome.as_str()) {
                 (Some(_), _, _) => "telephone inbox",
                 (None, Some(Runtime::Codex), "accepted") => "codex native queue",
-                (None, Some(Runtime::OpenCode), "accepted") => "opencode native HTTP",
                 (None, Some(Runtime::Claude), "unconfirmed") => "claude native socket",
                 _ => "unknown",
             };
@@ -223,7 +222,7 @@ mod tests {
             params![env.id.to_string(), serde_json::to_string(&env).unwrap()],
         )
         .unwrap();
-        // A damaged unrelated legacy record must not prevent creating the index.
+        // A damaged unrelated record must not prevent creating the index.
         db.execute(
             "INSERT INTO messages VALUES ('broken','not JSON','unknown')",
             [],

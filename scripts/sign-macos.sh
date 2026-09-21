@@ -25,7 +25,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 
 # Reject extra paths, duplicate entries and traversal before extracting anything.
 listing=$(tar -tzf "$input")
-[[ "$listing" == $'telephone\nREADME.md\nSECURITY.md\nLICENSE' ]] || fail 'Unexpected archive contents.'
+[[ "$listing" == $'telephone\nREADME.md\nSECURITY.md\nLICENSE\ndocs/codex-polling.md\ndocs/context-management.md\ndocs/compatibility.md' ]] || fail 'Unexpected archive contents.'
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/telephone-sign.XXXXXX")
 keychain="$work/signing.keychain-db"
 cleanup() {
@@ -49,7 +49,7 @@ trap 'exit 143' TERM
 
 mkdir "$work/package"
 tar -xzf "$input" -C "$work/package" --no-same-owner --no-same-permissions
-for name in telephone README.md SECURITY.md LICENSE; do
+for name in telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md; do
   [[ -f "$work/package/$name" && ! -L "$work/package/$name" ]] || fail "Not a regular file: $name"
   [[ $(stat -f %l "$work/package/$name") == 1 ]] || fail "Hard links are not allowed: $name"
 done
@@ -95,5 +95,5 @@ signature=$(codesign --display --verbose=4 "$binary" 2>&1)
 # Remove the key before packaging; the EXIT trap also covers every failure path.
 security delete-keychain "$keychain"
 mkdir -p "$(dirname "$output")"
-COPYFILE_DISABLE=1 tar -czf "$output" -C "$work/package" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$output" -C "$work/package" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 printf 'Developer ID signed: %s\n' "$output"

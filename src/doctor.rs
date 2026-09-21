@@ -18,21 +18,35 @@ pub fn recipient(address: &Address, as_json: bool) -> Result<()> {
         .context("unsupported recipient runtime")?;
     let report = adapter.find_exact(address)?;
     let agent = report.agents.iter().find(|a| a.address() == address);
-    let preferred = agent.and_then(|a| a.transports.first());
+    let native = agent.and_then(|a| a.transports.first());
+    let store = Store::open(&inbox::root()?)?;
+    let polling = agent
+        .and_then(|a| a.session_key.as_deref())
+        .map(|key| store.receiving(address, key, crate::envelope::now_millis()))
+        .transpose()?
+        .flatten();
+    let preferred = if agent.is_some() && polling.is_some() {
+        Some(&Transport::Inbox)
+    } else {
+        native
+    };
     let route_note = match preferred {
-        Some(Transport::CodexQueue) => "Native Codex queue bypasses telephone inbox/check_inbox; active turns may read it later. Use --delivery inbox (MCP: delivery=\"inbox\") for future polling exchanges.",
+        Some(Transport::CodexQueue) => "No fresh polling evidence. Native Codex queue bypasses telephone inbox/check_inbox; active turns may read it later.",
         Some(Transport::Inbox) => "Telephone inbox requires recipient polling; it does not wake an idle thread.",
         Some(_) => "Native route is configured, not probed; fallback may require recipient polling.",
-        None => "No current route discovered. Journal history can outlive a session or registration.",
+        None => "No current route discovered. Journal history can outlive a session.",
     };
-    let history = Store::open(&inbox::root()?)?.recent_deliveries(address)?;
-    let receipt_note = "History covers sends to this recipient from all local senders. Native read status and the recipient's current polling behavior are unknown. inbox_read only records a Telephone inbox response. Do not resend accepted or uncertain messages blindly.";
+    let history = store.recent_deliveries(address)?;
+    let receipt_note = "History covers sends to this recipient from all local senders. Recent polling is evidence, not a guarantee the peer is still waiting. Native read status is unknown. inbox_read only records a Telephone inbox response. Do not resend accepted or uncertain messages blindly.";
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "recipient": address,
                 "preferred_transport": preferred.map(Transport::label),
+                "native_transport": native.map(Transport::label),
+                "polling": polling,
+                "polling_ttl_ms": crate::store::receiving::POLLING_TTL_MS,
                 "liveness": agent.map(|a| a.liveness.as_str()),
                 "discovery_complete": report.complete,
                 "warnings": report.warnings,
@@ -54,6 +68,12 @@ pub fn recipient(address: &Address, as_json: bool) -> Result<()> {
             agent.map(|a| a.liveness.as_str()).unwrap_or("unknown")
         );
         println!("{route_note}");
+        if let Some(polling) = polling {
+            println!(
+                "Polling evidence: checked_at={}, expires_at={} (epoch milliseconds)",
+                polling.checked_at, polling.expires_at
+            );
+        }
         for warning in &report.warnings {
             crate::warn(warning);
         }

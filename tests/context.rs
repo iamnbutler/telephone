@@ -10,6 +10,7 @@ fn hook(home: &Path, input: &str) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_telephone"))
         .arg("context-hook")
         .env("HOME", home)
+        .env_remove("TELEPHONE_STATE_DIR")
         .env_remove("TELEPHONE_DEBUG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

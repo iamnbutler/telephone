@@ -27,7 +27,7 @@ fn identified(value: String, name: Option<String>, source: &'static str) -> Resu
     {
         bail!("invalid TELEPHONE_NAME");
     }
-    let runtime = address.runtime().ok();
+    let runtime = Some(address.runtime()?);
     Ok(Me {
         addr: Some(address),
         runtime,
@@ -39,8 +39,21 @@ pub fn whoami() -> Result<Me> {
     if let Some(value) = variable("TELEPHONE_ADDR")? {
         return identified(value, variable("TELEPHONE_NAME")?, "TELEPHONE_ADDR");
     }
-    if let Some(address) = crate::adapters::claude_code::ClaudeCode::parent_address()? {
-        return identified(address, None, "Claude parent session");
+    for (pid, command) in crate::proc::ancestors()? {
+        if matches!(command.as_str(), "codex" | "codex-cli") {
+            let id = variable("CODEX_THREAD_ID")?.context("Codex host has no thread identity; use Telephone CLI inside the native thread or MCP with per-call threadId (telephone install)")?;
+            return identified(
+                format!("codex:{id}"),
+                None,
+                "Codex ancestor / CODEX_THREAD_ID",
+            );
+        }
+        if let Some(address) = crate::adapters::claude_code::ClaudeCode::address_for_pid(pid)? {
+            return identified(address, None, "verified Claude ancestor");
+        }
+        if command == "claude" {
+            bail!("Claude host session identity is unavailable or stale; restart its Telephone MCP process or set TELEPHONE_ADDR explicitly");
+        }
     }
     let claude = variable("CLAUDE_PID")?;
     let codex = variable("CODEX_THREAD_ID")?;
@@ -67,21 +80,35 @@ pub fn whoami() -> Result<Me> {
     })
 }
 
-/// Per-call identities let a shared MCP server serve distinct threads. These are
-/// same-user routing hints, not credentials; never accept them from a network.
-pub fn for_call(explicit: Option<&str>, root: &std::path::Path) -> Result<Me> {
-    let me = match explicit {
-        Some(address) => identified(address.to_owned(), None, "explicit local inbox")?,
-        None => whoami()?,
-    };
-    if let Some(address) = &me.addr {
-        if address.inbox_runtime().is_some() {
-            return crate::store::Store::open(root)?
-                .registered_identity(address, crate::envelope::now_millis());
+/// Codex supplies the exact thread in tool-call metadata. Claude binds to the
+/// verified parent session. Never use an inherited outer Codex ID for MCP.
+pub fn for_call(metadata: Option<&serde_json::Map<String, serde_json::Value>>) -> Result<Me> {
+    let thread = metadata.and_then(|m| m.get("threadId"));
+    let me = if let Some(thread) = thread {
+        let thread = thread.as_str().context("MCP threadId must be a string")?;
+        uuid::Uuid::parse_str(thread).context("MCP threadId must be a UUID")?;
+        let me = identified(format!("codex:{thread}"), None, "Codex MCP threadId")?;
+        if let Some(value) = variable("TELEPHONE_ADDR")? {
+            let fixed = identified(value, variable("TELEPHONE_NAME")?, "TELEPHONE_ADDR")?;
+            if fixed.addr != me.addr {
+                bail!("MCP threadId conflicts with TELEPHONE_ADDR; remove the fixed override for a shared Codex host");
+            }
         }
-    }
-    if explicit.is_some() {
-        bail!("explicit MCP identity must be an opencode:, zed:, delta: or generic: registration");
-    }
+        for (pid, command) in crate::proc::ancestors()? {
+            if matches!(command.as_str(), "codex" | "codex-cli") {
+                break;
+            }
+            if crate::adapters::claude_code::ClaudeCode::address_for_pid(pid)?.is_some() {
+                bail!("Codex MCP threadId conflicts with the verified Claude host");
+            }
+        }
+        me
+    } else {
+        let me = whoami()?;
+        if me.runtime == Some(Runtime::Codex) && me.source != "TELEPHONE_ADDR" {
+            bail!("Codex MCP host did not supply per-call threadId. Upgrade the host or use Telephone CLI from this thread's shell. A shared MCP process cannot infer identity from inherited CODEX_THREAD_ID.");
+        }
+        me
+    };
     Ok(me)
 }

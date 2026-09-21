@@ -7,7 +7,6 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -18,12 +17,10 @@ const MAX_PENDING: i64 = 1000;
 
 pub mod context;
 pub mod diagnostics;
-pub mod opencode;
-pub mod registrations;
+pub mod receiving;
 
 pub struct Store {
     conn: Connection,
-    root: PathBuf,
     pub path: PathBuf,
 }
 pub struct InboxBatch {
@@ -74,20 +71,14 @@ impl Store {
                 CASE WHEN json_valid(envelope) THEN json_extract(envelope,'$.to') END);
             CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY REFERENCES messages(id), recipient TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS inbox_recipient ON inbox(recipient, read);
-            CREATE TABLE IF NOT EXISTS registrations (
-                address TEXT PRIMARY KEY, runtime TEXT NOT NULL, name TEXT NOT NULL,
-                last_seen INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS registrations_runtime ON registrations(runtime, expires_at);
-            CREATE TABLE IF NOT EXISTS opencode_routes (
-                address TEXT PRIMARY KEY REFERENCES registrations(address) ON DELETE CASCADE,
-                route TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS context_reminders (
                 session TEXT PRIMARY KEY, level INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS receiving (address TEXT PRIMARY KEY, session_key TEXT NOT NULL, checked_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS native_queue_notices (
                 recipient TEXT PRIMARY KEY, last_id TEXT NOT NULL);")
             .context("initializing message journal")?;
         private_fs::check_sidecars(&path)?;
-        Ok(Self { conn, root, path })
+        Ok(Self { conn, path })
     }
 
     pub fn prepare(&mut self, mut env: Envelope, reply_to: Option<Uuid>) -> Result<Envelope> {
@@ -151,8 +142,8 @@ impl Store {
         tx.commit().context("committing inbox deposit")
     }
 
-    pub fn inbox(mut self, addr: &Address, peek: bool) -> Result<InboxBatch> {
-        let mut warnings = self.import_legacy(addr)?;
+    pub fn inbox(self, addr: &Address, peek: bool) -> Result<InboxBatch> {
+        let mut warnings = Vec::new();
         // Connection-owned transaction: every early return/serialization/output
         // failure closes this connection and rolls back the read flags.
         self.conn
@@ -201,65 +192,6 @@ impl Store {
             warnings,
             notices,
         })
-    }
-
-    fn import_legacy(&mut self, addr: &Address) -> Result<Vec<String>> {
-        let parent = self.root.join("inbox");
-        if !parent
-            .try_exists()
-            .context("checking legacy inbox directory")?
-        {
-            return Ok(Vec::new());
-        }
-        private_fs::directory(&parent)?;
-        let old_slug: String = addr
-            .as_str()
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let dir = parent.join(old_slug);
-        if !dir
-            .try_exists()
-            .context("checking legacy recipient directory")?
-        {
-            return Ok(Vec::new());
-        }
-        private_fs::directory(&dir)?;
-        let mut warnings = Vec::new();
-        for (index, entry) in fs::read_dir(&dir)
-            .context("reading legacy inbox")?
-            .enumerate()
-        {
-            if index >= 1000 {
-                warnings.push(
-                    "Legacy inbox scan stopped at 1000 entries; files were preserved.".into(),
-                );
-                break;
-            }
-            let path = entry.context("reading legacy inbox entry")?.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            let result = (|| -> Result<()> {
-                let env = decode(&private_fs::read_owned(&path, MAX_ENVELOPE_BYTES)?)?;
-                if &env.to != addr {
-                    bail!("legacy filename collision: envelope belongs to a different address");
-                }
-                self.deposit(addr, &env)
-            })();
-            if let Err(e) = result {
-                warnings.push(format!("Legacy message {path:?} was not imported: {e:#}"));
-            }
-        }
-        // Original files remain recoverable. INSERT OR IGNORE preserves read
-        // state on subsequent scans; importing is idempotent, never a requeue.
-        Ok(warnings)
     }
 }
 
@@ -317,6 +249,7 @@ fn insert_inbox(conn: &Connection, addr: &Address, env: &Envelope) -> Result<()>
 mod tests {
     use super::*;
     use crate::envelope::Kind;
+    use std::fs;
     fn root() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
@@ -435,36 +368,6 @@ mod tests {
             .unwrap()
             .messages
             .is_empty());
-    }
-
-    #[test]
-    fn legacy_import_is_idempotent_and_preserves_files_and_wrong_recipients() {
-        let root = root();
-        let mut env = draft();
-        env.add_hop(env.from.clone()).unwrap();
-        let dir = root.path().join("inbox/claude-b");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("message.json");
-        fs::write(&path, serde_json::to_vec(&env).unwrap()).unwrap();
-        let wrong = dir.join("wrong.json");
-        let mut wrong_env = env.clone();
-        wrong_env.id = Uuid::new_v4();
-        wrong_env.to = "claude:elsewhere".parse().unwrap();
-        fs::write(&wrong, serde_json::to_vec(&wrong_env).unwrap()).unwrap();
-        let batch = Store::open(root.path())
-            .unwrap()
-            .inbox(&env.to, false)
-            .unwrap();
-        assert_eq!(batch.messages.len(), 1);
-        assert_eq!(batch.warnings.len(), 1);
-        batch.acknowledge().unwrap();
-        let batch = Store::open(root.path())
-            .unwrap()
-            .inbox(&env.to, false)
-            .unwrap();
-        assert!(batch.messages.is_empty());
-        batch.acknowledge().unwrap();
-        assert!(path.exists() && wrong.exists());
     }
 
     #[test]

@@ -1,59 +1,57 @@
-# Polling during an active Codex turn
+# Automatic routing and native queues
 
-The native Codex queue can accept a message that the current turn will not read
-until it ends. `telephone inbox` reads the polling inbox, not native queue history.
-For a team already doing work and polling for replies, all senders can choose
-the inbox per message:
+`telephone inbox` / `check_inbox` reads Telephone's inbox, not a runtime's native
+queue. A native Codex message may wait until an active turn ends. Telephone 0.2
+uses fresh receiver evidence to avoid that mismatch for active exchanges.
 
-```sh
-export TELEPHONE_ADDR='your-actual-session-address'
-telephone send <codex-address> --delivery inbox --kind request 'Please review the task and reply.'
-telephone inbox
-```
+## Route selection
 
-MCP callers set `delivery: "inbox"` on `send_message`; this works without restarting
-or changing the environment of a shared MCP server. The option also works for
-other runtimes whose recipient has agreed to poll. The default `delivery: "auto"`
-uses the existing native/fallback preferences. Neither option grants permission
-to start an exchange or changes how the sender receives replies.
+Each inbox check, including a peek, advertises polling for **15 seconds**. Sending
+`kind: request` advertises the sender's return path for the same period, so a
+fast reply can reach its inbox before the first poll. Continue polling every two
+seconds while waiting, up to 30 seconds or the user's deadline.
 
-For a session-wide Codex-only preference, the existing `TELEPHONE_CODEX_INBOX=1`
-environment variable still works. Set it in each sending CLI/MCP process.
-Discovery then lists Codex inbox transport; other runtimes keep their normal
-routes. Without that variable or a per-call override, native delivery is preferred.
+For each new request or reply independently:
 
-Inbox delivery does not wake an idle thread. Agree on polling first. Reply using
-`--kind reply --reply-to <id>`, and do not acknowledge acknowledgments. An empty
-inbox is not evidence of a failed send.
+1. Explicit `--delivery inbox` / `delivery: "inbox"` selects the Telephone inbox.
+2. Fresh recipient evidence selects the inbox automatically.
+3. Otherwise use the native route, with inbox fallback only before native sending
+   has started.
 
-This selects a route before native delivery starts. It neither reads an earlier
-native queue nor retries its messages. Do not resend an uncertain or accepted
-native message merely to move it into the inbox.
+Codex evidence is keyed to the native thread ID. Claude evidence is tied to its
+PID **and session ID**, with a verified process start, so a replacement session
+does not inherit another session's polling window. Unknown evidence is not
+polling. Clock rollback invalidates evidence from the future.
+
+An inbox does not wake idle agents. If a receiver stops polling just after its
+advertisement, messages already queued there stay there until its next check.
+Expired evidence changes routing for new messages only. It never triggers a
+resend, migration or duplicate copy of an accepted or uncertain native message.
+
+CLI and MCP share receiving state. A long-running sender MCP process observes
+route changes without restarting or modifying its environment. All peers must
+use the same Telephone state directory.
 
 ## Seeing where a message went
 
-Native send reports explicitly say that native delivery bypasses
-`telephone inbox` / `check_inbox`. For an empty Codex inbox, Telephone checks the
-last 20 journaled sends to that address and reports accepted native-queue entries.
-This is local acceptance history: Telephone cannot tell whether Codex has read
-them, whether they are still pending, or whether the recipient currently polls.
-Failed or uncertain sends are not counted as accepted.
+Native send results distinguish acceptance from unconfirmed writes and explain
+that native delivery bypasses Telephone's inbox. An empty Codex inbox checks the
+last 20 journaled sends to that address and reports native queue acceptance once
+per newly observed acceptance. Read status remains unknown. A peek may repeat
+the notice. Failed or uncertain sends are not counted as accepted.
 
-An ordinary inbox poll shows the notice once per newly observed native acceptance.
-`inbox --peek` (MCP: `peek: true`) can repeat the diagnostic without consuming it.
-CLI `inbox --json` keeps its JSON array on stdout and puts the notice on stderr;
-MCP returns a `notices` array alongside `messages` and `warnings`. Failed or
-cancelled response output does not consume the notice. No native message is
-copied, marked read in Codex, or replayed.
+CLI `inbox --json` keeps an array on stdout and emits notices on stderr. MCP
+returns `messages`, `warnings` and `notices`. Failed or cancelled response output
+does not consume the notice. Telephone never marks native messages read.
 
 ```sh
-telephone doctor <codex-address>
-telephone doctor <codex-address> --json
+telephone doctor <address>
+telephone doctor <address> --json
 ```
 
-This reports the currently preferred transport and the latest 20 journal entries
-to that exact recipient, from all local senders, with outcomes and Telephone inbox
-receipt state. It includes older entries written before these diagnostics were
-added. Message bodies are omitted. History remains available after the recipient
-disappears from discovery. The command does not probe native delivery or send
-messages. `recent?` still means inferred liveness, not evidence of a polling inbox.
+Doctor reports preferred and native transports, fresh polling timestamps and
+expiry, and the latest 20 journal entries to that recipient from
+all local senders. It omits message bodies. Native read status stays unknown;
+`inbox_read` only records a flushed Telephone response. History remains available
+after the native session disappears. Doctor does not send, probe a transport or
+refresh a polling window.

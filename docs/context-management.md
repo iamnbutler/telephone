@@ -3,7 +3,7 @@
 Keep peer updates to new findings, decisions, blockers and relevant file paths.
 Avoid repeated plans, full transcripts and acknowledgment loops. Telephone's
 message wrapper retains provenance and a reply command; polling instructions
-only accompany registration and sends from registered inboxes.
+only accompany requests.
 
 ## Claude Code reminders
 
@@ -64,4 +64,4 @@ starts a new conversation and is not a substitute while work is pending.
 See Claude's [hook reference](https://code.claude.com/docs/en/hooks#add-context-for-claude)
 and [auto-compaction settings](https://code.claude.com/docs/en/model-config#set-the-auto-compact-window).
 Other runtimes should use their native context/compaction controls; this hook
-only understands Claude Code transcripts and does not monitor Codex or OpenCode.
+only understands Claude Code transcripts and does not monitor Codex.
