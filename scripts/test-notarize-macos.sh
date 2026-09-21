@@ -26,11 +26,12 @@ case $(uname -m) in
 esac
 printf 'int main(void) { return 0; }\n' | cc -x c - -o "$work/input/telephone"
 codesign --force --sign - "$work/input/telephone"
-for name in README.md SECURITY.md LICENSE; do
+mkdir "$work/input/docs"
+for name in README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md; do
   printf 'Notarization-test fixture.\n' > "$work/input/$name"
 done
 archive="$work/input.tar.gz"
-COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work/input" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 original_keychains=$(security list-keychains -d user)
 original_hash=$(shasum -a 256 "$archive")
 
@@ -67,12 +68,12 @@ expect_failure 'wrong architecture' 'Binary architecture does not match' \
   "${notarize[@]}" "$other" "$archive" "$work/report"
 expect_failure 'ad-hoc signature' 'Expected a valid Developer ID signature' \
   "${notarize[@]}" "$target" "$archive" "$work/report"
-COPYFILE_DISABLE=1 tar -czf "$work/duplicate.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE telephone
+COPYFILE_DISABLE=1 tar -czf "$work/duplicate.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md telephone
 expect_failure 'duplicate member' 'Unexpected archive contents' \
   "${notarize[@]}" "$target" "$work/duplicate.tar.gz" "$work/report"
 mv "$work/input/telephone" "$work/untouched"
 ln -s "$work/untouched" "$work/input/telephone"
-COPYFILE_DISABLE=1 tar -czf "$work/symlink.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$work/symlink.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 expect_failure 'symlink member' 'Not a regular file: telephone' \
   "${notarize[@]}" "$target" "$work/symlink.tar.gz" "$work/report"
 python3 -B "$repo_root/scripts/test_notarytool.py"

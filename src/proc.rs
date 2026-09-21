@@ -43,6 +43,44 @@ pub fn parent_pid() -> u32 {
     unsafe { libc_getppid() as u32 }
 }
 
+/// A bounded ancestry walk through executable names, never command arguments.
+pub fn ancestors() -> anyhow::Result<Vec<(u32, String)>> {
+    use anyhow::{bail, Context};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut result = Vec::new();
+    let mut pid = parent_pid();
+    for _ in 0..16 {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .context("native ancestry lookup timed out")?;
+        let mut command = Command::new("ps");
+        command.args(["-p", &pid.to_string(), "-o", "ppid=,comm="]);
+        let output = crate::process::run(command, remaining)
+            .map_err(|e| anyhow::anyhow!("native ancestry lookup failed: {e}"))?;
+        if !output.status.success() {
+            bail!("cannot inspect native ancestor {pid}");
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let (parent, command) = raw
+            .trim()
+            .split_once(char::is_whitespace)
+            .context("invalid native ancestry response")?;
+        let parent: u32 = parent.trim().parse()?;
+        let name = std::path::Path::new(command.trim())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("invalid native executable name")?;
+        result.push((pid, name.to_owned()));
+        // We only need the nearest native host. Querying each ancestor keeps
+        // output bounded even on machines with thousands of processes.
+        if matches!(name, "codex" | "codex-cli" | "claude") || parent == pid || parent <= 1 {
+            return Ok(result);
+        }
+        pid = parent;
+    }
+    bail!("native ancestry exceeds 16 processes; set TELEPHONE_ADDR explicitly")
+}
+
 /// How far a process's start may sit from its session's recorded start before
 /// we treat the pid as belonging to somebody else.
 ///

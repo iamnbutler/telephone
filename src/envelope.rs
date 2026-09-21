@@ -42,8 +42,6 @@ impl Kind {
 #[serde(rename_all = "lowercase")]
 pub enum Trust {
     #[default]
-    // Legacy "peer" is read as untrusted, never as a distinct authority level.
-    #[serde(alias = "peer")]
     Untrusted,
 }
 
@@ -60,9 +58,6 @@ pub struct Envelope {
     pub to: Address,
     pub kind: Kind,
     pub body: String,
-    // Older versions wrote null here. Non-null delivery controls are unsupported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivery: Option<()>,
     #[serde(default)]
     pub trust: Trust,
     #[serde(default)]
@@ -86,7 +81,6 @@ impl Envelope {
             from_name: None,
             kind,
             body,
-            delivery: None,
             trust: Trust::Untrusted,
             hop_chain: Vec::new(),
             sent_at: now_millis(),
@@ -154,9 +148,5 @@ mod tests {
         e.reply_to = Some(Uuid::new_v4());
         assert!(e.validate().is_ok());
         assert_eq!(e.trust, Trust::Untrusted);
-        assert_eq!(
-            serde_json::from_str::<Trust>("\"peer\"").unwrap(),
-            Trust::Untrusted
-        );
     }
 }

@@ -28,11 +28,12 @@ case $(uname -m) in
   *) printf 'Unsupported host.\n' >&2; exit 1 ;;
 esac
 printf 'int main(void) { return 0; }\n' | cc -x c - -o "$work/input/telephone"
-for name in README.md SECURITY.md LICENSE; do
+mkdir "$work/input/docs"
+for name in README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md; do
   printf 'Signing-test fixture.\n' > "$work/input/$name"
 done
 archive="$work/input.tar.gz"
-COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work/input" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$archive" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 original_keychains=$(security list-keychains -d user)
 
 expect_failure() {
@@ -86,24 +87,24 @@ openssl pkcs12 -export -in "$work/test-cert.pem" -inkey "$work/test-key.pem" \
 expect_failure 'real PKCS#12 and search-list cleanup' 'Expected only the pinned, valid signing identity' \
   env MACOS_CERTIFICATE_P12_BASE64="$(base64 < "$work/test.p12")" \
   "${sign[@]}" "$target" "$archive" "$work/output.tar.gz"
-COPYFILE_DISABLE=1 tar -czf "$work/duplicate.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE telephone
+COPYFILE_DISABLE=1 tar -czf "$work/duplicate.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md telephone
 expect_failure 'duplicate archive member' 'Unexpected archive contents' \
   "${sign[@]}" "$target" "$work/duplicate.tar.gz" "$work/output.tar.gz"
 mv "$work/input/telephone" "$work/untouched"
 ln -s "$work/untouched" "$work/input/telephone"
 original_hash=$(shasum -a 256 "$work/untouched")
-COPYFILE_DISABLE=1 tar -czf "$work/symlink.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$work/symlink.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 expect_failure 'symlink archive member' 'Not a regular file: telephone' \
   "${sign[@]}" "$target" "$work/symlink.tar.gz" "$work/output.tar.gz"
 [[ $(shasum -a 256 "$work/untouched") == "$original_hash" ]]
 rm "$work/input/telephone" "$work/input/README.md"
 mv "$work/untouched" "$work/input/telephone"
 ln "$work/input/telephone" "$work/input/README.md"
-COPYFILE_DISABLE=1 tar -czf "$work/hardlink.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE
+COPYFILE_DISABLE=1 tar -czf "$work/hardlink.tar.gz" -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 expect_failure 'hard-linked archive members' 'Hard links are not allowed' \
   "${sign[@]}" "$target" "$work/hardlink.tar.gz" "$work/output.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$work/traversal.tar.gz" -s ',LICENSE,../outside,' \
-  -C "$work/input" telephone README.md SECURITY.md LICENSE
+  -C "$work/input" telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md
 expect_failure 'archive path traversal' 'Unexpected archive contents' \
   "${sign[@]}" "$target" "$work/traversal.tar.gz" "$work/output.tar.gz"
 [[ ! -e "$work/outside" && ! -e "$RUNNER_TEMP/outside" ]]

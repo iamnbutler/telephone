@@ -20,7 +20,9 @@
 
 mod adapters;
 mod address;
+mod context;
 mod discovery;
+mod doctor;
 mod envelope;
 mod guidance;
 mod identity;
@@ -29,6 +31,7 @@ mod mcp;
 mod private_fs;
 mod proc;
 mod process;
+mod receiving;
 mod registry;
 mod runtime;
 mod send;
@@ -37,7 +40,7 @@ mod store;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use envelope::Kind;
-use registry::{Adapter, Registry};
+use registry::Registry;
 use std::io::Write;
 
 /// Diagnostics for the paths that silently fall back, gated behind
@@ -67,16 +70,10 @@ fn console_text(value: &str) -> String {
 
 /// Every adapter telephone knows about, in preference order.
 pub fn default_registry() -> Result<Registry> {
-    registry_at(&inbox::root()?)
-}
-
-fn registry_at(root: &std::path::Path) -> Result<Registry> {
-    let mut adapters: Vec<Box<dyn Adapter>> = vec![
+    Ok(Registry::new(vec![
         Box::new(adapters::claude_code::ClaudeCode::new()?),
         Box::new(adapters::codex::Codex::new()?),
-    ];
-    adapters.extend(adapters::registered_adapters(root));
-    Ok(Registry::new(adapters))
+    ]))
 }
 
 #[derive(Parser)]
@@ -92,49 +89,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register a pollable inbox for an OpenCode, Zed, Delta or other thread
-    Register {
-        /// Generate a unique address for this runtime
-        #[arg(long, value_enum, conflicts_with = "address")]
-        runtime: Option<runtime::InboxRuntime>,
-        /// Register or renew this exact address (defaults to TELEPHONE_ADDR)
-        #[arg(long)]
-        address: Option<String>,
-        /// Optional display name (not a unique identifier)
-        #[arg(long)]
-        name: Option<String>,
-        /// Include lease timestamps and polling instructions as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Stop routing new messages to a registered inbox; preserve its messages
-    Unregister {
-        /// Defaults to your current identity
-        address: Option<String>,
-    },
-
-    /// Opt into native delivery to an existing, trusted local OpenCode server
-    BindOpencode {
-        #[arg(long)]
-        address: String,
-        /// Canonical http://127.0.0.1:PORT or http://[::1]:PORT; no remote hosts
-        #[arg(long)]
-        endpoint: String,
-        /// Actual OpenCode ses_ ID (not the Telephone address UUID)
-        #[arg(long)]
-        session: String,
-        /// Existing session's absolute directory
-        #[arg(long)]
-        directory: String,
-        /// Owner-only JSON file containing username and password; never pass a token in argv
-        #[arg(long)]
-        credentials: std::path::PathBuf,
-    },
-
-    /// Remove a native binding while retaining the polling inbox
-    UnbindOpencode { address: String },
-
     /// List messageable agents on this machine
     #[command(alias = "ls")]
     List {
@@ -158,6 +112,9 @@ enum Command {
         /// Message id this is a reply to
         #[arg(long)]
         reply_to: Option<String>,
+        /// Use inbox for a polling recipient; auto follows fresh polling evidence, otherwise native/fallback
+        #[arg(long, value_enum, default_value = "auto")]
+        delivery: send::Delivery,
     },
 
     /// Read messages sent to you
@@ -173,14 +130,23 @@ enum Command {
     /// Report which agent telephone thinks you are
     Whoami,
 
-    /// Run as an MCP server over stdio (the universal adapter)
+    /// Run as an MCP server over stdio
     Mcp,
 
     /// Report discovered agents, configured routes and liveness evidence
-    Doctor,
+    Doctor {
+        /// Inspect this exact recipient's route and recent delivery history
+        address: Option<address::Address>,
+        /// Emit per-recipient diagnostics as JSON
+        #[arg(long, requires = "address")]
+        json: bool,
+    },
 
     /// Print the configuration needed to wire telephone into each runtime
     Install,
+
+    /// Claude Code hook: remind at 250k/300k context tokens (JSON on stdin)
+    ContextHook,
 }
 
 fn main() -> std::process::ExitCode {
@@ -196,96 +162,17 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Register {
-            runtime,
-            address,
-            name,
-            json,
-        } => {
-            let mut address = address;
-            let mut name = name;
-            if runtime.is_none() && address.is_none() {
-                let me = identity::whoami()?;
-                address = me.addr.map(String::from);
-                name = name.or(me.name);
-            }
-            let address = store::registrations::registration_address(runtime, address.as_deref())?;
-            let registration = store::Store::open(&inbox::root()?)?.register(
-                &address,
-                name.as_deref(),
-                envelope::now_millis(),
-            )?;
-            let output = if json {
-                serde_json::to_string(&guidance::RegistrationReport::new(&registration))?
-            } else {
-                registration.address.to_string()
-            };
-            let mut stdout = std::io::stdout().lock();
-            writeln!(stdout, "{output}").context("writing registration; it may already exist")?;
-            stdout
-                .flush()
-                .context("flushing registration; it may already exist")?;
-            if !json {
-                // Keep stdout address-only for command substitution. Advice is
-                // best-effort: a broken stderr must not imply registration failed.
-                let mut stderr = std::io::stderr().lock();
-                if writeln!(
-                    stderr,
-                    "{}",
-                    guidance::Polling::new(&registration.address).text(None)
-                )
-                .is_err()
-                {
-                    // The address was already flushed; do not retry registration.
-                }
-            }
-            Ok(())
-        }
-        Command::Unregister { address } => {
-            let address = match address {
-                Some(a) => a,
-                None => identity::whoami()?
-                    .addr
-                    .context("set TELEPHONE_ADDR or supply an address")?
-                    .into(),
-            };
-            store::Store::open(&inbox::root()?)?.unregister(&address.parse()?)
-        }
-        Command::BindOpencode {
-            address,
-            endpoint,
-            session,
-            directory,
-            credentials,
-        } => {
-            let address = address.parse()?;
-            adapters::opencode::address(&address)?;
-            let root = inbox::root()?;
-            store::Store::open(&root)?.registered_identity(&address, envelope::now_millis())?;
-            let route = adapters::opencode::Route::try_from(adapters::opencode::RouteConfig {
-                endpoint,
-                session_id: session,
-                directory,
-                credentials,
-            })?;
-            route.verify()?;
-            store::Store::open(&root)?.bind_opencode(&address, &route)?;
-            writeln!(std::io::stdout().lock(), "Bound {address} to its existing OpenCode session. Native prompts can start model work. HTTP acceptance is not a read receipt; inbox fallback still requires polling.")
-                .context("writing binding result; the binding may already exist")
-        }
-        Command::UnbindOpencode { address } => {
-            store::Store::open(&inbox::root()?)?.unbind_opencode(&address.parse()?)
-        }
         Command::List { json, all } => cmd_list(json, all),
         Command::Send {
             to,
             body,
             kind,
             reply_to,
+            delivery,
         } => {
             let kind = Kind::parse(&kind)
                 .ok_or_else(|| anyhow::anyhow!("kind must be inform, request, reply or event"))?;
-            let report = send::send(&to, &body, kind, reply_to)?;
+            let report = send::send(&to, &body, kind, reply_to, delivery)?;
             let mut stdout = std::io::stdout().lock();
             writeln!(stdout, "{report}").context(
                 "writing send report; delivery may already have occurred, do not retry blindly",
@@ -298,8 +185,19 @@ fn run() -> Result<()> {
         Command::Inbox { peek, json } => cmd_inbox(peek, json),
         Command::Whoami => cmd_whoami(),
         Command::Mcp => mcp::serve(),
-        Command::Doctor => cmd_doctor(),
+        Command::Doctor {
+            address: Some(address),
+            json,
+        } => doctor::recipient(&address, json),
+        Command::Doctor { address: None, .. } => cmd_doctor(),
         Command::Install => cmd_install(),
+        Command::ContextHook => {
+            // Advisory hooks must never block a tool or turn on a read/state error.
+            if let Err(e) = context::run() {
+                debug(|| format!("context reminder skipped: {e:#}"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -388,6 +286,12 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
     if inferred {
         println!("recent? = was active recently, but nothing could confirm it is still running");
     }
+    if agents
+        .iter()
+        .any(|a| matches!(a.transports.first(), Some(registry::Transport::CodexQueue)))
+    {
+        println!("queue = native Codex queue, separate from telephone inbox; use --delivery inbox for polling peers");
+    }
     for w in warnings {
         warn(w);
     }
@@ -407,7 +311,16 @@ fn cmd_inbox(peek: bool, json: bool) -> Result<()> {
     for warning in &batch.warnings {
         warn(warning);
     }
-    let rendered = if json {
+    // Preserve the JSON array on stdout. Failed notice output rolls back its
+    // receipt, just like failed message output, so a later poll can see it.
+    if json && !batch.notices.is_empty() {
+        let mut stderr = std::io::stderr().lock();
+        for notice in &batch.notices {
+            writeln!(stderr, "notice: {}", serde_json::json!(notice))?;
+        }
+        stderr.flush()?;
+    }
+    let mut rendered = if json {
         serde_json::to_string_pretty(&batch.messages)?
     } else if batch.messages.is_empty() {
         "No new messages.".into()
@@ -419,6 +332,12 @@ fn cmd_inbox(peek: bool, json: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+    if !json {
+        for notice in &batch.notices {
+            rendered.push('\n');
+            rendered.push_str(notice);
+        }
+    }
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{rendered}").context("writing inbox; messages remain unread on failure")?;
     stdout
@@ -523,9 +442,12 @@ fn cmd_doctor() -> Result<()> {
     }
 
     if let Some(addr) = &me.addr {
-        let batch = inbox::read(addr, true)?;
+        let batch = store::Store::open(&inbox::root()?)?.inbox(addr, true)?;
         let waiting = batch.messages.len();
         println!("\ninbox:      {waiting} message(s) waiting");
+        for notice in &batch.notices {
+            println!("{notice}");
+        }
         batch.acknowledge()?;
     }
     Ok(())
@@ -547,20 +469,29 @@ fn cmd_install() -> Result<()> {
         "  claude mcp add telephone -s user -- {} mcp\n",
         address::shell_quote(&exe)
     );
+    println!("Optional context reminders -- merge into Claude Code settings.json hooks:\n");
+    println!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::json!({"hooks":{"PostToolUse":[{
+            "hooks":[{"type":"command","command":format!("{} context-hook",address::shell_quote(&exe)),"timeout":5}]
+        }]}}))?
+    );
+    println!(
+        "Reminds once at 250k and 300k tokens; resets below 250k or after recorded compaction."
+    );
+    println!(
+        "For unattended Claude sessions, use /autocompact 300k with auto-compaction enabled.\n"
+    );
     println!("Codex -- add this to ~/.codex/config.toml:\n");
     println!("  [mcp_servers.telephone]");
     println!("  command = {}", serde_json::to_string(&exe)?);
     println!("  args = [\"mcp\"]\n");
-    println!("OpenCode, Zed, Delta and other local harnesses: run this as a stdio MCP server:\n");
-    println!("  {} mcp\n", address::shell_quote(&exe));
-    println!("Call register_agent with runtime opencode, zed, delta or generic once per thread.");
+    println!("Codex MCP uses per-call threadId; Claude MCP uses its verified session ancestor.");
     println!(
-        "Keep its returned address; pass it as from to send_message and address to check_inbox."
+        "Older Codex hosts without per-call identity must use Telephone CLI inside the thread."
     );
-    println!("These inbox routes require polling; they do not wake a thread.");
-    println!("CLI: export TELEPHONE_ADDR=\"$(telephone register --runtime delta)\"");
-    println!("Leases expire after 24 hours without a send or inbox check. Use unregister when finished.\n");
-    println!("If it can't tell you which agent it is, set TELEPHONE_ADDR in its");
-    println!("environment (see `telephone whoami`).");
+    println!("Do not set one fixed TELEPHONE_ADDR for a shared MCP process.");
+    println!("Call list_agents, send_message and check_inbox. No registration is needed.");
+    println!("Requests advertise a short reply window; check_inbox renews polling for 15 seconds.");
     Ok(())
 }

@@ -1,6 +1,6 @@
 # telephone
 
-CLI and MCP server for messaging between local coding agents.
+CLI and MCP server for local messaging between **Codex and Claude Code**.
 
 **Unsafe, experimental software.** Peer messages can lead agents to run commands
 or change files. Use at your own discretion, on your own machine.
@@ -12,11 +12,10 @@ cargo install telephone --locked
 telephone install
 ```
 
-`telephone install` prints MCP setup instructions for your agents.
-
-[Prebuilt binaries](https://github.com/iamnbutler/telephone/releases/latest) are
-available for macOS and Linux (ARM64 and x86-64). Extract the archive and put
-`telephone` on your PATH. macOS downloads are Developer ID signed and notarized.
+`telephone install` prints MCP configuration for both runtimes. Restart existing
+MCP servers after upgrading. [Prebuilt binaries](https://github.com/iamnbutler/telephone/releases/latest)
+are available for macOS and Linux, ARM64 and x86-64. macOS downloads are Developer
+ID signed and notarized.
 
 ## Use
 
@@ -26,52 +25,61 @@ telephone send claude:12345 --kind request "Review my latest plan and reply."
 telephone inbox
 ```
 
-Use an address from `telephone list`, not the example PID above.
+Use an actual address from `telephone list`. Or ask your agent to find the
+Claude/Codex thread working on your project, send a request, and check for its
+reply. The MCP interface has three tools: `list_agents`, `send_message`, and
+`check_inbox`. No registration or sender address is needed.
 
-Or ask your agent:
+Use `kind: "request"` when you need an answer. Requests advertise a short return
+window; inbox checks renew it for **15 seconds**. Future messages to that thread
+choose its Telephone inbox automatically. Poll every two seconds for up to
+30 seconds or the user's deadline. Reply with `kind: "reply"` and the incoming
+`reply_to` ID (CLI: `--kind reply --reply-to <id>`). Do not acknowledge replies.
 
-> Use Telephone to find the Claude Code session working in example-app. Read
-> its latest plan, check it against the code, and send feedback. Include
-> instructions for replying.
+When polling evidence expires, new messages use the native route: Claude's
+session socket or Codex's queue. A failed connection may fall back to the inbox
+before any bytes are sent. Inbox delivery requires polling and cannot wake an
+idle thread. Stopping a poll can leave a recently queued message waiting there.
 
-Replace `example-app` with your project directory. The agents read the history
-and code themselves; Telephone handles discovery and delivery.
+**Acceptance is not a read receipt.** Codex may read a native queue message after
+its active turn ends; that message is absent from `check_inbox`. Claude socket
+writes are unconfirmed. Telephone never mirrors or replays accepted or uncertain
+native sends. Empty Codex inboxes show relevant native acceptance history once.
+Use `telephone doctor <address>` to inspect current routing evidence and recent
+outcomes. See [routing and diagnostics](docs/codex-polling.md).
 
-Native delivery depends on runtime internals. If unavailable before sending,
-messages go to an inbox the receiving agent must check. A socket write is not
-a receipt; Telephone reports uncertainty and does not retry it automatically.
+`--delivery inbox` (MCP: `delivery: "inbox"`) explicitly chooses polling for a
+new message. Ordinary exchanges use `auto`.
 
-To reply, use `--kind reply --reply-to <message-id>`. Replies must match a
-message in the local journal; exchanges stop after eight hops.
+## Native identity
 
-`live` means the process and its start time were verified. `recent?` is only
-an inference; Codex threads use this label. `telephone list --all` includes
-quiet threads. Listings are capped; exact addresses use a separate lookup.
-If discovery is incomplete, Telephone reports it and refuses short-name routing.
+CLI commands use the nearest verified Claude ancestor or Codex's shell thread
+ID. Codex MCP uses the host's per-call `threadId` metadata; Claude MCP uses its
+verified session ancestor. A working directory, display name or newest session
+is never used to infer your identity. In `list_agents`, `you` is your address.
 
-See `telephone --help` and [security and upgrade notes](SECURITY.md).
+Codex hosts that omit per-call identity must use the CLI from the thread's shell,
+or a dedicated MCP process explicitly bound to that exact thread. Do not configure
+one fixed address for multiple threads. `TELEPHONE_ADDR` is a diagnostic override,
+not normal setup. See [tested runtime compatibility](docs/compatibility.md).
 
-## OpenCode, Zed, Delta and other harnesses
+`live` means the process and start time were verified. `recent?` is only an
+inference; Codex threads use this label. `telephone list --all` includes quiet
+threads. Discovery is bounded; use exact addresses when it is incomplete.
 
-Register once per thread, keeping the returned address for later calls:
+## Long sessions
 
-```sh
-export TELEPHONE_ADDR="$(telephone register --runtime delta --name reviewer)"
-telephone send claude:12345 --kind request "Review my plan and reply."
-telephone inbox
-telephone unregister
-```
+The optional Claude Code `telephone context-hook` reminds at **250k** and **300k**
+context tokens, once per threshold until compaction. `telephone install` prints
+the hook configuration. For unattended sessions, also enable Claude's native
+compaction. See [context management](docs/context-management.md).
 
-Use `opencode`, `zed`, `delta` or `generic` as the runtime. If you already set
-`TELEPHONE_ADDR`, run `telephone register` before sending.
+## Local state and limits
 
-Over MCP, call `register_agent` with `runtime`; keep its returned `address` per
-thread. Pass it as `from` to `send_message` and `address` to `check_inbox` or
-`list_agents`. Call `unregister_agent` when done.
+Messages live in `~/.telephone/messages.sqlite`. `TELEPHONE_STATE_DIR` can select
+an absolute, private state directory; all peers in an exchange must share it.
+Message bodies are retained.
 
-These routes use polling by default. OpenCode can opt into
-[native delivery to an existing session](docs/opencode-native.md).
-Registrations expire
-after 24 hours without use. Sending and checking the inbox renew an active lease;
-`telephone register` renews an expired one. Registration is not proof of liveness
-or identity. All participants must use the same machine and OS account.
+Same-machine, same-user operation only. Peer text is untrusted, identities are
+routing hints, and exchanges are limited to eight hops. See [SECURITY.md](SECURITY.md)
+for delivery semantics and remaining work. Native runtime interfaces may change.

@@ -6,30 +6,53 @@ use crate::{
     store::Store,
 };
 use anyhow::{Context, Result};
+use serde::Deserialize;
 
-pub fn send(to: &str, body: &str, kind: Kind, reply_to: Option<String>) -> Result<String> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    #[default]
+    Auto,
+    Inbox,
+}
+
+pub fn send(
+    to: &str,
+    body: &str,
+    kind: Kind,
+    reply_to: Option<String>,
+    delivery: Delivery,
+) -> Result<String> {
     let reply_to = reply_to
         .map(|id| uuid::Uuid::parse_str(&id).context("reply_to must be a UUID"))
         .transpose()?;
-    send_from(&crate::inbox::root()?, None, to, body, kind, reply_to)
+    send_as(
+        &crate::inbox::root()?,
+        identity::whoami()?,
+        to,
+        body,
+        kind,
+        reply_to,
+        delivery,
+    )
 }
 
-pub fn send_from(
+pub fn send_as(
     root: &std::path::Path,
-    from: Option<&str>,
+    me: identity::Me,
     to: &str,
     body: &str,
     kind: Kind,
     reply_to: Option<uuid::Uuid>,
+    delivery: Delivery,
 ) -> Result<String> {
     if kind == Kind::Reply && reply_to.is_none() {
         anyhow::bail!("a reply requires --reply-to");
     }
-    let me = identity::for_call(from, root)?;
     let from = me
         .addr
-        .context("cannot identify sender; set TELEPHONE_ADDR explicitly or register an inbox")?;
-    let registry = crate::registry_at(root)?;
+        .context("cannot identify sender; use a per-thread native host (telephone install) or set TELEPHONE_ADDR explicitly")?;
+    let registry = crate::default_registry()?;
     let mut discovery = registry.discover();
     let target = registry.resolve(&mut discovery, to).with_context(|| {
         format!(
@@ -46,18 +69,33 @@ pub fn send_from(
         .context("no adapter for target runtime")?;
     let mut store = Store::open(root)?;
     let env = store.prepare(draft, reply_to)?;
-    // The sender's return path does not depend on the recipient's transport or
-    // on `kind`: an inform message can still ask for a reply in its body. Advice
-    // is conditional on an expected reply, never an instruction to start a loop.
-    let receiving = if env.from.inbox_runtime().is_some() {
-        format!(
-            "\n\nReceiving replies:\n{}",
-            crate::guidance::Polling::new(&env.from).text(Some(env.id))
-        )
+    let receiving = if env.kind == Kind::Request {
+        crate::receiving::advertise(root, &env.from)?;
+        format!("\n{}", crate::guidance::WAITING)
     } else {
         String::new()
     };
-    let outcome = match adapter.deliver(&target, &env) {
+    let polling = target
+        .session_key
+        .as_deref()
+        .map(|key| store.receiving(&env.to, key, crate::envelope::now_millis()))
+        .transpose()?
+        .flatten();
+    let delivered = if delivery == Delivery::Inbox || polling.is_some() {
+        let deposited = store.deposit(&env.to, &env);
+        deposited.map(|()| Delivered::Queued {
+            path: store.path.clone(),
+            note: if delivery == Delivery::Inbox {
+                "Inbox delivery requested; no native wake-up attempted."
+            } else {
+                "Recipient recently checked its inbox or requested a reply; selected polling automatically."
+            }
+            .into(),
+        })
+    } else {
+        adapter.deliver(&target, &env)
+    };
+    let outcome = match delivered {
         Ok(outcome) => outcome,
         Err(e) => {
             if let Err(journal) = store.outcome(env.id, "failed-or-uncertain") {
@@ -73,12 +111,16 @@ pub fn send_from(
         Delivered::Unconfirmed { via } => (
             "unconfirmed",
             format!(
-                "Written over {via}; acceptance and reading are unconfirmed. Do not retry blindly."
+                "Written over {via}; acceptance and reading are unconfirmed. Native delivery does not populate telephone inbox/check_inbox. Do not retry blindly."
             ),
+        ),
+        Delivered::Accepted { via: "codex queue" } => (
+            "accepted",
+            "Accepted by codex queue; not a read receipt. This bypasses telephone inbox/check_inbox and may wait until the recipient's active turn ends. Fresh recipient inbox checks select polling for future messages. Do not resend this accepted message blindly.".into(),
         ),
         Delivered::Accepted { via } => (
             "accepted",
-            format!("Accepted by {via}; not a read receipt."),
+            format!("Accepted by {via}; not a read receipt. Native delivery does not populate telephone inbox/check_inbox."),
         ),
         Delivered::Queued { path, note } => (
             "queued",

@@ -53,7 +53,8 @@ impl Server {
             .args(["--exact", "mcp::integration::server_child", "--ignored"])
             .env("TELEPHONE_TEST_MCP_ROOT", root.path())
             .env("TELEPHONE_TEST_MCP_SOCKET", &socket)
-            .env("TELEPHONE_ADDR", "test:receiver")
+            .env("TELEPHONE_ADDR", "codex:receiver")
+            .env_remove("TELEPHONE_STATE_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -168,7 +169,7 @@ impl Server {
         for _ in 0..count {
             let mut env = Envelope::new(
                 "test:sender",
-                "test:receiver",
+                "codex:receiver",
                 Kind::Inform,
                 "x".repeat(size),
             )

@@ -24,7 +24,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 notary=(python3 "$script_dir/notarytool.py")
 archive_hash=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
 listing=$(tar -tzf "$archive")
-[[ "$listing" == $'telephone\nREADME.md\nSECURITY.md\nLICENSE' ]] || fail 'Unexpected archive contents.'
+[[ "$listing" == $'telephone\nREADME.md\nSECURITY.md\nLICENSE\ndocs/codex-polling.md\ndocs/context-management.md\ndocs/compatibility.md' ]] || fail 'Unexpected archive contents.'
 
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/telephone-notary.XXXXXX")
 keychain="$work/notary.keychain-db"
@@ -49,7 +49,7 @@ trap 'exit 143' TERM
 
 mkdir "$work/package"
 tar -xzf "$archive" -C "$work/package" --no-same-owner --no-same-permissions
-for name in telephone README.md SECURITY.md LICENSE; do
+for name in telephone README.md SECURITY.md LICENSE docs/codex-polling.md docs/context-management.md docs/compatibility.md; do
   [[ -f "$work/package/$name" && ! -L "$work/package/$name" ]] || fail "Not a regular file: $name"
   [[ $(stat -f %l "$work/package/$name") == 1 ]] || fail "Hard links are not allowed: $name"
 done

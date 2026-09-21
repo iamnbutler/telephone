@@ -20,9 +20,6 @@ impl Address {
     pub fn local_id(&self) -> &str {
         &self.value[self.prefix_end + 1..]
     }
-    pub fn inbox_runtime(&self) -> Option<crate::runtime::InboxRuntime> {
-        self.runtime.and_then(crate::runtime::Runtime::registered)
-    }
 }
 impl FromStr for Address {
     type Err = anyhow::Error;
@@ -78,22 +75,14 @@ mod tests {
     use super::*;
     #[test]
     fn typed_runtimes_preserve_address_wire_format_and_unknown_envelope_data() {
-        let known: Address = "opencode:thread-1".parse().unwrap();
-        assert_eq!(known.runtime().unwrap(), crate::runtime::Runtime::OpenCode);
-        assert_eq!(
-            known.inbox_runtime(),
-            Some(crate::runtime::InboxRuntime::OpenCode)
-        );
+        let known: Address = "codex:thread-1".parse().unwrap();
+        assert_eq!(known.runtime().unwrap(), crate::runtime::Runtime::Codex);
         assert_eq!(known.local_id(), "thread-1");
-        assert_eq!(
-            serde_json::to_string(&known).unwrap(),
-            "\"opencode:thread-1\""
-        );
-        let restored: Address = serde_json::from_str("\"opencode:thread-1\"").unwrap();
+        assert_eq!(serde_json::to_string(&known).unwrap(), "\"codex:thread-1\"");
+        let restored: Address = serde_json::from_str("\"codex:thread-1\"").unwrap();
         assert_eq!(known, restored);
         let unknown: Address = "future:thread-1".parse().unwrap();
         assert!(unknown.runtime().is_err());
-        assert!(unknown.inbox_runtime().is_none());
         assert_eq!(unknown.local_id(), "thread-1");
         assert_eq!(
             serde_json::to_string(&unknown).unwrap(),

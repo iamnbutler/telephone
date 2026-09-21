@@ -1,12 +1,12 @@
 [package]
 name = "telephone"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
-description = "CLI and MCP server for messaging between local coding agents"
+description = "Local messaging between Codex and Claude Code"
 license = "MIT"
 repository = "https://github.com/iamnbutler/telephone"
 readme = "README.md"
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "docs/opencode-native.md", "LICENSE"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "docs/codex-polling.md", "docs/context-management.md", "docs/compatibility.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1"
@@ -20,8 +20,6 @@ rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "limits"] }
 libc = "0.2"
 socket2 = "0.6"
 sha2 = "0.10"
-ureq = { version = "3.3", default-features = false }
-base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

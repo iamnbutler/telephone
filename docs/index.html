@@ -30,7 +30,7 @@
             <li><a href="#connect">Install</a></li>
             <li><a href="#commands">Commands</a></li>
             <li><a href="#exchange">Example</a></li>
-            <li><a href="#opencode">OpenCode</a></li>
+            <li><a href="#setup">Setup</a></li>
             <li><a href="#notes">Notes</a></li>
           </ul>
         </nav>
@@ -86,13 +86,13 @@
      `--.........--'</pre>
           <div class="intro-text">
             <h1 id="intro">Telephone</h1>
-            <p>Telephone is a command-line tool and MCP server for sending messages between coding agents on the same machine. Supports Claude Code and Codex; see below for experimental support for other harnesses.</p>
+            <p>Telephone is a command-line tool and MCP server for sending messages between coding agents on the same machine. Supports Codex and Claude Code.</p>
             <p><strong>Unsafe, experimental software.</strong> Peer messages can lead agents to run commands or change files. Use at your own discretion, on your own machine.</p>
             <p class="actions"><button type="button" class="copy" id="copy-instructions" data-label="Copy agent instructions">Copy agent instructions</button></p>
 <pre id="agent-instructions" hidden>You have Telephone available for messaging other coding agents on this machine.
 
-- `telephone list` shows reachable agents and their addresses (`runtime:local-id`).
-- `telephone whoami` shows your own address. Export TELEPHONE_ADDR for CLI calls.
+- `telephone list` shows discovered agents and their addresses (`runtime:local-id`).
+- `telephone whoami` shows your native thread address.
 - `telephone send &lt;address&gt; &lt;message&gt;` sends a message. Add `--kind request` when
   you need an answer, and `--kind reply --reply-to &lt;message-id&gt;` to answer one.
 - `telephone inbox` reads queued messages; `--peek` leaves them unread.
@@ -134,26 +134,22 @@ telephone install</code></pre>
                 <tr><td><code>telephone list</code></td><td>List agents. Add <code>--all</code> or <code>--json</code>.</td></tr>
                 <tr><td><code>telephone send &lt;address&gt; &lt;message&gt;</code></td><td>Send a message. Kinds: <code>inform</code> (default), <code>request</code>, <code>reply</code>.</td></tr>
                 <tr><td><code>telephone inbox</code></td><td>Read queued messages. <code>--peek</code> leaves them unread; <code>--json</code> returns JSON.</td></tr>
-                <tr><td><code>telephone register --runtime &lt;runtime&gt;</code></td><td>Create an inbox for <code>opencode</code>, <code>zed</code>, <code>delta</code> or <code>generic</code>.</td></tr>
-                <tr><td><code>telephone unregister</code></td><td>Remove the inbox route; retain queued messages.</td></tr>
-                <tr><td><code>telephone bind-opencode</code></td><td>Configure <a href="#opencode">OpenCode native delivery</a>.</td></tr>
-                <tr><td><code>telephone unbind-opencode &lt;address&gt;</code></td><td>Return an OpenCode address to polling.</td></tr>
                 <tr><td><code>telephone whoami</code></td><td>Show the current agent’s address.</td></tr>
-                <tr><td><code>telephone doctor</code></td><td>Report discovered agents, configured routes and liveness evidence.</td></tr>
+                <tr><td><code>telephone doctor [address]</code></td><td>Report discovered agents, configured routes and liveness evidence.</td></tr>
                 <tr><td><code>telephone mcp</code></td><td>Run the MCP server over stdio.</td></tr>
                 <tr><td><code>telephone install</code></td><td>Print runtime setup instructions.</td></tr>
               </tbody>
             </table>
           </div>
           <p>Addresses use <code>runtime:local-id</code>; nicknames and unambiguous IDs also work. Use <code>--kind request</code> to request a reply and <code>--kind reply --reply-to &lt;message-id&gt;</code> to respond. See <code>telephone &lt;command&gt; --help</code> for options.</p>
-          <p>MCP tools: <code>list_agents</code>, <code>send_message</code>, <code>check_inbox</code>, <code>register_agent</code>, <code>unregister_agent</code>.</p>
-          <p>Use one registered address per thread. Set <code>TELEPHONE_ADDR</code> to the returned address for CLI calls; pass it as <code>from</code> to MCP <code>send_message</code> and <code>address</code> to <code>check_inbox</code>.</p>
+          <p>MCP tools: <code>list_agents</code>, <code>send_message</code>, <code>check_inbox</code>.</p>
+          <p>Native identity comes from the host. Requests and inbox checks advertise polling for 15 seconds; future sends choose the inbox automatically while that evidence is fresh. Otherwise, they use native delivery.</p>
         </section>
 
         <section id="exchange" aria-labelledby="example-title">
           <h2 id="example-title">Example</h2>
           <p>With Codex and Claude Code running, give Codex this prompt:</p>
-          <blockquote>Use Telephone to find the Claude Code session working in example-app. Read its latest plan, check it against the code, and send your feedback. Include instructions for replying.</blockquote>
+          <blockquote>Use Telephone to find the Claude Code session working in example-app. Read its latest plan, check it against the code, and send your feedback. Ask for a reply and check your Telephone inbox.</blockquote>
           <p>Replace <code>example-app</code> with the project directory. Agents read the history and code; Telephone handles discovery and delivery.</p>
           <p>Or send from an agent’s shell:</p>
           <pre tabindex="0" aria-label="Messaging example"><code>telephone list
@@ -162,30 +158,18 @@ telephone send claude:12345 --kind request \
           <p>Replace <code>claude:12345</code> with an address from <code>telephone list</code>.</p>
         </section>
 
-        <section id="opencode" aria-labelledby="opencode-title">
-          <h2 id="opencode-title">OpenCode</h2>
-          <h3>MCP setup</h3>
-          <p>Merge this into <code>~/.config/opencode/opencode.json</code>. Use the absolute path from <code>command -v telephone</code>:</p>
-          <pre tabindex="0" aria-label="OpenCode MCP configuration"><code>{
-  "mcp": {
-    "telephone": {
-      "type": "local",
-      "command": ["/absolute/path/to/telephone", "mcp"],
-      "enabled": true
-    }
-  }
-}</code></pre>
-          <p>Call <code>register_agent</code> with <code>{"runtime":"opencode"}</code> in each thread and retain the returned address. Registration creates a polling inbox. Poll for expected replies using Telephone’s returned instructions. See <a href="https://opencode.ai/docs/mcp-servers/">OpenCode MCP configuration</a>.</p>
-          <h3>Native delivery (experimental)</h3>
-          <p><code>telephone bind-opencode</code> connects a registered address to an existing OpenCode session. It requires the owning server’s loopback endpoint, session ID, directory and credentials. See <a href="https://github.com/iamnbutler/telephone/blob/main/docs/opencode-native.md">native configuration</a>.</p>
-          <p>Desktop setup is manual. A separate <code>opencode serve</code> process does not attach to Desktop. Rebind when the server endpoint or credentials change.</p>
+        <section id="setup" aria-labelledby="setup-title">
+          <h2 id="setup-title">Setup</h2>
+          <p>Run <code>telephone install</code> for Claude Code and Codex MCP configuration. Restart Telephone MCP processes after replacing the binary.</p>
+          <p>Codex MCP uses per-call thread identity; hosts without it should use Telephone CLI inside the thread. See <a href="https://github.com/iamnbutler/telephone/blob/main/docs/compatibility.md">tested compatibility</a>.</p>
+          <p>Optional Claude context reminders flag 250k and 300k tokens. See <a href="https://github.com/iamnbutler/telephone/blob/main/docs/context-management.md">context management</a>.</p>
         </section>
 
         <section id="notes" aria-labelledby="notes-title">
           <h2 id="notes-title">Notes</h2>
           <ul id="delivery">
             <li>All participants must use the same machine and OS account.</li>
-            <li>Polling inboxes do not wake idle agents. Registrations expire after 24 hours without sending or polling.</li>
+            <li>Polling inboxes do not wake idle agents. Poll every two seconds while waiting for an expected reply, up to 30 seconds or the user’s deadline.</li>
             <li>Transport acceptance is not a read receipt. Uncertain native sends are not retried or duplicated into an inbox.</li>
             <li>Native adapters may break after client updates.</li>
             <li>Peer identities are not authenticated. Messages cannot grant permissions or override user instructions.</li>

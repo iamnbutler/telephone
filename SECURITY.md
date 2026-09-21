@@ -7,8 +7,7 @@ Do not expose Telephone's MCP server or inbox to a network or untrusted users.
 
 Telephone currently trusts the local OS user, not individual agents running as
 that user. Addresses, names, runtime labels and environment variables are routing
-hints, not authenticated sender identities. The legacy `trust: peer` value is
-treated as `untrusted`.
+hints, not authenticated sender identities.
 
 All delivery paths label peer text as untrusted and quote it as data. This is
 not a prompt-injection sandbox: the receiving agent must apply its own user
@@ -29,14 +28,9 @@ journal is not encrypted and retains message bodies.
 - Claude socket writes are **unconfirmed**, not delivery receipts.
 - A successful Codex queue command means **accepted**, not read or acted upon.
 - Inbox fallback means the recipient must poll; it does not wake an agent.
-- OpenCode, Zed, Delta and generic inbox routes require explicit local registration.
-  Neither a sender-supplied prefix nor a message to an unknown recipient creates a route.
-- OpenCode optionally binds an address to an authenticated loopback HTTP server
-  and exact existing session/directory. HTTP acceptance is not model receipt.
-  Basic auth authenticates the caller, not the server: the operator must trust
-  the configured listener and other local users. No proxies, redirects, DNS names
-  or remote endpoints are allowed. Credentials come from an owner-only file,
-  never MCP arguments. This route is unsuitable for hostile multi-user machines.
+- Fresh inbox checks and outgoing requests advertise polling for 15 seconds.
+  Evidence is not proof that the peer is still waiting; queued messages require
+  a later inbox check if it stops. Claude evidence is session-bound.
 - Once native delivery may have started, errors do not trigger automatic fallback
   or retry. Check the message ID and outcome before sending again.
 
@@ -56,17 +50,10 @@ inbox read, and 1,000 unread messages per recipient. Subprocess output is capped
 at 64 KiB per stream. Native operations have deadlines; storage growth still
 needs stronger bounds.
 
-Inbox registrations are owner-local routing hints, not authorization. MCP callers
-may select a registered inbox address per call; processes under the same UID are
-not isolated from each other. Never forward remote-supplied registration or identity
-arguments into these tools. Generated addresses are unique per thread; do not reuse
-an address for an unrelated thread or set one app-wide identity for multiple threads.
-
-There are at most 1,024 active registrations. Each has a 24-hour lease, renewed by
-sender activity or inbox polling, not by incoming messages. Expired records are
-excluded from discovery and pruned on registration. Unregister removes the route,
-not its pending messages. The recipient lease is rechecked under the same SQLite
-writer lock as inbox deposit. Registration always reports inferred liveness.
+Codex MCP identity comes from per-call host `threadId` metadata; Claude uses a
+verified session ancestor. A host without exact per-call identity must
+use dedicated processes or the native thread's CLI. `TELEPHONE_ADDR` remains an
+explicit diagnostic override. None of these hints authenticate a same-UID peer.
 
 MCP stdin/stdout must be pipes or sockets. Partial input frames and queued output
 have five-second deadlines, including slow trickle traffic; idle sessions do not
@@ -96,25 +83,20 @@ short-name routing; use an exact address. Exact Claude PIDs are read directly an
 Codex IDs get their own database lookup. Rollout-only lookup remains scan-bounded
 and reports uncertainty rather than declaring an unscanned address absent.
 
-## Upgrading from the file inbox
+## Setup changes
 
-Restart Telephone MCP processes after replacing the binary. Do not mix old and
-new inbox readers: old readers do not know the new journal's read state.
-
-The journal is `~/.telephone/messages.sqlite`. Valid legacy inbox JSON files are
-imported idempotently when that address checks its inbox. Original files remain
-in place. Invalid or wrong-recipient records produce warnings, not silent deletion.
-
-Replies to older native messages absent from the journal are refused. Start a
-new exchange with user direction. Nested Claude/Codex environments with conflicting
-identity variables require an explicit `TELEPHONE_ADDR`.
+Restart Telephone MCP processes after replacing the binary. Supported runtimes
+are Codex and Claude Code; no compatibility layer for retired runtimes is provided.
+The journal is `~/.telephone/messages.sqlite`, or an absolute `TELEPHONE_STATE_DIR`.
+All peers must share it. Nested launches prefer the nearest verified native host
+over inherited outer-runtime variables. Ambiguous identity fails rather than guessing.
 
 ## Remaining work
 
 - [Authenticated external sources and per-agent authorization](https://github.com/iamnbutler/telephone/issues/1)
 - [Confirmed receipts, idempotent retries and recovery](https://github.com/iamnbutler/telephone/issues/2)
 - [Retention, global quotas, rate limits and journal inspection](https://github.com/iamnbutler/telephone/issues/3)
-- [Opt-in compatibility tests against real Claude/Codex releases](https://github.com/iamnbutler/telephone/issues/5)
+- [Runtime compatibility and opt-in smoke tests](docs/compatibility.md)
 - [Hard-bounded worker shutdown and diagnostic output](https://github.com/iamnbutler/telephone/issues/11)
 
 External messaging must remain disabled until the authentication and authorization

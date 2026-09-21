@@ -7,10 +7,12 @@ fn isolated(home: &std::path::Path, identity: Option<&str>) -> Command {
     command
         .env("HOME", home)
         .env_remove("CODEX_HOME")
+        .env_remove("CODEX_CLI_PATH")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLAUDE_PID")
         .env_remove("TELEPHONE_ADDR")
         .env_remove("TELEPHONE_NAME")
+        .env_remove("TELEPHONE_STATE_DIR")
         .env_remove("CLAUDE_CODE_MESSAGING_SOCKET");
     if let Some(identity) = identity {
         command.env("TELEPHONE_ADDR", identity);
@@ -28,152 +30,6 @@ fn success(home: &std::path::Path, identity: Option<&str>, args: &[&str]) -> Str
     String::from_utf8(out.stdout).unwrap()
 }
 
-fn assert_polling_text(text: &str, address: &str) {
-    assert!(
-        text.contains("Telephone will not wake this thread"),
-        "{text}"
-    );
-    assert!(
-        text.contains(&format!("check_inbox with {{\"address\":\"{address}\"}}")),
-        "{text}"
-    );
-    assert!(text.contains(&format!("TELEPHONE_ADDR='{address}' telephone inbox")));
-    assert!(text.contains("every 2 seconds for up to 30 seconds"));
-    assert!(text.contains("otherwise report it pending"));
-    assert!(text.contains("Do not resend because the inbox is empty"));
-    assert!(text.contains("acknowledge acknowledgments"));
-}
-
-#[test]
-fn cli_registration_teaches_polling_without_changing_address_only_stdout() {
-    use serde_json::Value;
-    let home = tempfile::tempdir().unwrap();
-    let output = isolated(home.path(), None)
-        .args(["register", "--runtime", "delta"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let address = stdout.trim();
-    assert_eq!(stdout.lines().count(), 1);
-    assert!(address.starts_with("delta:"));
-    assert!(uuid::Uuid::parse_str(address.strip_prefix("delta:").unwrap()).is_ok());
-    assert_polling_text(&String::from_utf8(output.stderr).unwrap(), address);
-
-    let report: Value = serde_json::from_str(&success(
-        home.path(),
-        Some(address),
-        &["register", "--json"],
-    ))
-    .unwrap();
-    assert_eq!(report["address"], address);
-    assert!(report["last_seen"].is_number());
-    assert!(report["expires_at"].is_number());
-    assert_eq!(report["receiving"]["check_inbox"]["tool"], "check_inbox");
-    assert_eq!(
-        report["receiving"]["check_inbox"]["arguments"]["address"],
-        address
-    );
-    assert!(report["receiving"]["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("poll your own inbox"));
-}
-
-#[test]
-fn doctor_reports_configured_routes_without_claiming_or_probing_reachability() {
-    let home = tempfile::tempdir().unwrap();
-    let registered = success(home.path(), None, &["register", "--runtime", "opencode"]);
-    let address = registered.trim();
-    // Seed persisted configuration, not a fake HTTP response. There is no server
-    // accepting requests and no credential file; discovery must not require either.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let route = serde_json::json!({
-        "endpoint": format!("http://{}", listener.local_addr().unwrap()),
-        "session_id": "ses_doctor_test",
-        "directory": home.path(),
-        "credentials": home.path().join("absent-credentials.json"),
-    });
-    let db = rusqlite::Connection::open(home.path().join(".telephone/messages.sqlite")).unwrap();
-    db.execute(
-        "INSERT INTO opencode_routes(address,route) VALUES (?1,?2)",
-        rusqlite::params![address, route.to_string()],
-    )
-    .unwrap();
-    drop(db);
-
-    let output = success(home.path(), Some(address), &["doctor"]);
-    let line = output
-        .lines()
-        .find(|line| line.trim_start().starts_with("opencode "))
-        .unwrap();
-    assert!(line.contains("1 native route(s) configured"), "{output}");
-    assert!(line.contains("0 confirmed live"), "{output}");
-    assert!(!output.contains("reachable natively"), "{output}");
-    assert!(output.contains("not proof of reachability or receipt"));
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock,
-        "doctor must not probe a configured OpenCode endpoint"
-    );
-}
-
-#[test]
-fn separate_cli_processes_exchange_replies_for_each_registered_runtime() {
-    use serde_json::Value;
-    let home = tempfile::tempdir().unwrap();
-    let first = success(home.path(), None, &["register", "--runtime", "generic"]);
-    let first = first.trim();
-    for runtime in ["opencode", "zed", "delta"] {
-        let second = success(home.path(), None, &["register", "--runtime", runtime]);
-        let second = second.trim();
-        assert!(second.starts_with(&format!("{runtime}:")));
-        let out = success(
-            home.path(),
-            Some(first),
-            &["send", second, "hello", "--kind", "request"],
-        );
-        assert!(out.contains("Queued in Telephone inbox"));
-        assert_polling_text(&out, first);
-        let inbox: Value =
-            serde_json::from_str(&success(home.path(), Some(second), &["inbox", "--json"]))
-                .unwrap();
-        assert_eq!(inbox[0]["from"], first);
-        assert_eq!(inbox[0]["body"], "hello");
-        let id = inbox[0]["id"].as_str().unwrap();
-        assert!(out.contains(&format!("in reply to'): {id}.")));
-        success(
-            home.path(),
-            Some(second),
-            &["send", first, "reply", "--kind", "reply", "--reply-to", id],
-        );
-        let reply: Value =
-            serde_json::from_str(&success(home.path(), Some(first), &["inbox", "--json"])).unwrap();
-        assert_eq!(reply[0]["reply_to"], id);
-        assert_eq!(reply[0]["conversation"], inbox[0]["conversation"]);
-        assert_eq!(reply[0]["hop_chain"].as_array().unwrap().len(), 2);
-        assert_eq!(reply[0]["from"], second);
-        assert_eq!(
-            success(home.path(), Some(first), &["inbox", "--json"]).trim(),
-            "[]"
-        );
-        success(home.path(), Some(second), &["unregister"]);
-        let rejected = isolated(home.path(), Some(first))
-            .args(["send", second, "after unregister"])
-            .output()
-            .unwrap();
-        assert!(!rejected.status.success());
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("no agent matches"));
-    }
-    let rejected = isolated(home.path(), Some("delta:never-registered"))
-        .args(["send", first, "one-way trap"])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("not registered"));
-}
-
 struct McpProcess {
     child: std::process::Child,
     writer: std::os::unix::net::UnixStream,
@@ -181,7 +37,7 @@ struct McpProcess {
     next_id: u64,
 }
 impl McpProcess {
-    fn start(home: &std::path::Path) -> Self {
+    fn from_command(mut command: Command) -> Self {
         use std::{os::fd::OwnedFd, os::unix::net::UnixStream, time::Duration};
         let (client, server) = UnixStream::pair().unwrap();
         client
@@ -190,7 +46,7 @@ impl McpProcess {
         client
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let child = isolated(home, None)
+        let child = command
             .arg("mcp")
             .stdin(Stdio::from(OwnedFd::from(server.try_clone().unwrap())))
             .stdout(Stdio::from(OwnedFd::from(server)))
@@ -250,79 +106,6 @@ impl Drop for McpProcess {
     }
 }
 
-#[test]
-fn shared_mcp_server_keeps_thread_addresses_separate_and_cli_can_reply() {
-    use serde_json::{json, Value};
-    let home = tempfile::tempdir().unwrap();
-    let mut mcp = McpProcess::start(home.path());
-    let one: Value = serde_json::from_str(&mcp.tool(
-        "register_agent",
-        json!({"runtime":"zed","name":"same-name"}),
-    ))
-    .unwrap();
-    // Execute the returned recipe against the actual MCP process, not a mock.
-    let recipe = &one["receiving"]["check_inbox"];
-    let empty: Value = serde_json::from_str(&mcp.tool(
-        recipe["tool"].as_str().unwrap(),
-        recipe["arguments"].clone(),
-    ))
-    .unwrap();
-    assert_eq!(empty["messages"], json!([]));
-    assert_eq!(recipe["arguments"]["address"], one["address"]);
-    let two: Value = serde_json::from_str(&mcp.tool(
-        "register_agent",
-        json!({"runtime":"zed","name":"same-name"}),
-    ))
-    .unwrap();
-    let one = one["address"].as_str().unwrap();
-    let two = two["address"].as_str().unwrap();
-    assert_ne!(one, two);
-    let listed: Value =
-        serde_json::from_str(&mcp.tool("list_agents", json!({"address":one}))).unwrap();
-    assert_eq!(listed["you"], one);
-    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["agents"][0]["address"], two);
-    assert_eq!(listed["agents"][0]["transport"], "inbox");
-    let sent = mcp.tool(
-        "send_message",
-        json!({"from":one,"to":two,"body":"thread-specific request","kind":"request"}),
-    );
-    assert_polling_text(&sent, one);
-    let inbox: Value =
-        serde_json::from_str(&success(home.path(), Some(two), &["inbox", "--json"])).unwrap();
-    let id = inbox[0]["id"].as_str().unwrap();
-    success(
-        home.path(),
-        Some(two),
-        &[
-            "send",
-            one,
-            "thread-specific reply",
-            "--kind",
-            "reply",
-            "--reply-to",
-            id,
-        ],
-    );
-    let response = mcp.tool("check_inbox", json!({"address":one}));
-    assert!(response.contains("thread-specific reply"));
-    assert!(response.contains(id));
-    let empty: Value =
-        serde_json::from_str(&mcp.tool("check_inbox", json!({"address":two}))).unwrap();
-    assert_eq!(empty["messages"], json!([]));
-    mcp.tool("unregister_agent", json!({"address":one}));
-    let rejected = mcp.request(
-        "tools/call",
-        json!({"name":"send_message","arguments":{"from":one,"to":two,"body":"expired"}}),
-    );
-    assert_eq!(rejected["isError"], true);
-    let rejected = mcp.request(
-        "tools/call",
-        json!({"name":"check_inbox","arguments":{"address":"claude:123"}}),
-    );
-    assert_eq!(rejected["isError"], true);
-}
-
 fn native_fixture(home: &std::path::Path) -> (std::os::unix::net::UnixListener, String) {
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -339,7 +122,7 @@ fn native_fixture(home: &std::path::Path) -> (std::os::unix::net::UnixListener, 
     let claude = format!("claude:{pid}");
     fs::write(
         sessions.join(format!("{pid}.json")),
-        json!({"pid":pid,"sessionId":"socket-fixture","messagingSocketPath":socket}).to_string(),
+        json!({"pid":pid,"sessionId":"socket-fixture","startedAt":now(),"messagingSocketPath":socket}).to_string(),
     )
     .unwrap();
     let hash = Sha256::digest(socket.as_os_str().as_bytes());
@@ -368,7 +151,7 @@ fn accept_peer(listener: &std::os::unix::net::UnixListener) -> std::os::unix::ne
 }
 
 #[test]
-fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
+fn native_socket_then_automatic_reply_and_safe_fallback_use_real_processes() {
     use serde_json::Value;
     use std::{
         io::Read,
@@ -401,19 +184,18 @@ fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
         frames[1].clone()
         // Dropping the listener leaves the pathname in place: future connect gets refused.
     });
-    let sender = success(home.path(), None, &["register", "--runtime", "delta"]);
-    let sender = sender.trim();
+    let sender = seed_codex(home.path(), "sender");
+    let sender = sender.as_str();
     let out = success(
         home.path(),
         Some(sender),
-        // The real-client regression used inform despite asking for a reply.
-        &["send", &claude, "native request", "--kind", "inform"],
+        &["send", &claude, "native request", "--kind", "request"],
     );
     assert!(out.contains("Written over uds"));
-    assert_polling_text(&out, sender);
+    assert!(out.contains("every 2 seconds"));
     let received = receiving.join().unwrap();
     let id = received["msg_id"].as_str().unwrap();
-    assert!(out.contains(&format!("in reply to'): {id}.")));
+    assert!(out.contains(id));
     assert!(received["message"]["content"]
         .as_str()
         .unwrap()
@@ -447,7 +229,6 @@ fn native_socket_then_registered_reply_and_safe_fallback_use_real_processes() {
         &["send", &claude, "safe fallback"],
     );
     assert!(out.contains("Queued in Telephone inbox"));
-    assert_polling_text(&out, sender);
     let inbox: Value =
         serde_json::from_str(&success(home.path(), Some(&claude), &["inbox", "--json"])).unwrap();
     assert_eq!(inbox.as_array().unwrap().len(), 1);
@@ -480,7 +261,7 @@ fn native_failure_after_connection_never_queues_a_duplicate() {
         }
         stream.shutdown(Shutdown::Both).unwrap();
     });
-    let sender = success(home.path(), None, &["register", "--runtime", "opencode"]);
+    let sender = "codex:sender";
     // JSON escaping makes the real payload larger than the socket's buffer.
     let out = isolated(home.path(), Some(sender.trim()))
         .args(["send", &claude, &"\u{1}".repeat(65536)])
@@ -493,7 +274,6 @@ fn native_failure_after_connection_never_queues_a_duplicate() {
     let error: String =
         serde_json::from_str(stderr.trim().strip_prefix("error: ").unwrap()).unwrap();
     assert!(error.contains("uncertain"));
-    assert_polling_text(&error, sender.trim());
     assert!(error.contains("inspect before retrying"));
     let db = rusqlite::Connection::open(home.path().join(".telephone/messages.sqlite")).unwrap();
     let count: i64 = db
@@ -549,4 +329,238 @@ fn packaged_stdio_protocol_initializes_and_answers_ping() {
         .collect();
     assert_eq!(values.len(), 2);
     assert_eq!(values[1]["result"], serde_json::json!({}));
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+fn seed_codex(home: &std::path::Path, thread: &str) -> String {
+    let root = home.join(".codex");
+    std::fs::create_dir_all(&root).unwrap();
+    let conn = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,cwd TEXT,agent_nickname TEXT,updated_at_ms INTEGER,updated_at INTEGER,archived INTEGER);").unwrap();
+    conn.execute(
+        "INSERT INTO threads VALUES (?1,?2,'same-name',?3,?4,0)",
+        rusqlite::params![
+            thread,
+            home.to_str().unwrap(),
+            now() as i64,
+            (now() / 1000) as i64
+        ],
+    )
+    .unwrap();
+    format!("codex:{thread}")
+}
+fn fake_codex(home: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let cli = home.join("codex-cli");
+    std::fs::write(
+        &cli,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$QUEUE_LOG\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cli
+}
+fn journal(home: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(home.join(".telephone/messages.sqlite")).unwrap()
+}
+
+#[test]
+fn polling_routes_automatically_expires_and_never_replays_native_messages() {
+    use serde_json::{json, Value};
+    let home = tempfile::tempdir().unwrap();
+    let sender = seed_codex(home.path(), "sender");
+    let recipient = seed_codex(home.path(), "recipient");
+    let cli = fake_codex(home.path());
+    let log = home.path().join("queue.log");
+    let doctor = || {
+        let output = isolated(home.path(), None)
+            .env("CODEX_CLI_PATH", &cli)
+            .env("QUEUE_LOG", &log)
+            .args(["doctor", &recipient, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let mut command = isolated(home.path(), Some(&sender));
+    command.env("CODEX_CLI_PATH", &cli).env("QUEUE_LOG", &log);
+    let mut mcp = McpProcess::from_command(command);
+    let native = mcp.tool("send_message", json!({"to":recipient,"body":"native"}));
+    assert!(native.contains("Accepted by codex queue; not a read receipt"));
+    assert!(native.contains("bypasses telephone inbox/check_inbox"));
+    let native_log = std::fs::read(&log).unwrap();
+    // CLI inbox advertises its native thread and surfaces separate native history once.
+    let empty = isolated(home.path(), Some(&recipient))
+        .args(["inbox", "--json"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&empty.stdout).unwrap(),
+        json!([])
+    );
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("Native read status is unknown"));
+    let quiet = isolated(home.path(), Some(&recipient))
+        .args(["inbox", "--json"])
+        .output()
+        .unwrap();
+    assert!(quiet.stderr.is_empty());
+    // Same MCP process, same environment, different route based on receiving evidence.
+    let sent = mcp.tool("send_message", json!({"to":recipient,"body":"automatic"}));
+    assert!(sent.contains("selected polling automatically"));
+    assert_eq!(std::fs::read(&log).unwrap(), native_log);
+    let received: Value = serde_json::from_str(&success(
+        home.path(),
+        Some(&recipient),
+        &["inbox", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(received.as_array().unwrap().len(), 1);
+    assert_eq!(received[0]["body"], "automatic");
+    let fresh = doctor();
+    assert_eq!(fresh["preferred_transport"], "inbox");
+    assert_eq!(fresh["native_transport"], "queue");
+    assert!(fresh["polling"]["expires_at"].as_u64().unwrap() > now());
+    let conn = journal(home.path());
+    conn.execute("UPDATE receiving SET checked_at=1,expires_at=2", [])
+        .unwrap();
+    let stale = doctor();
+    assert_eq!(stale["preferred_transport"], "queue");
+    assert!(stale["polling"].is_null());
+    assert_eq!(
+        std::fs::read(&log).unwrap(),
+        native_log,
+        "doctor never probes or refreshes polling"
+    );
+    assert!(mcp
+        .tool("send_message", json!({"to":recipient,"body":"expired"}))
+        .contains("Accepted by codex queue"));
+    assert_ne!(std::fs::read(&log).unwrap(), native_log);
+    assert!(mcp
+        .tool(
+            "send_message",
+            json!({"to":recipient,"body":"forced","delivery":"inbox"})
+        )
+        .contains("no native wake-up attempted"));
+    let mut receiver = McpProcess::from_command(isolated(home.path(), Some(&recipient)));
+    let received: Value = serde_json::from_str(&receiver.tool("check_inbox", json!({}))).unwrap();
+    assert_eq!(received["messages"].as_array().unwrap().len(), 1);
+    assert!(received["messages"][0].as_str().unwrap().contains("forced"));
+    assert_eq!(received["notices"].as_array().unwrap().len(), 0);
+    let quiet: Value = serde_json::from_str(&receiver.tool("check_inbox", json!({}))).unwrap();
+    assert_eq!(quiet["messages"], json!([]));
+    assert_eq!(quiet["notices"].as_array().unwrap().len(), 1);
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "accepted native sends are not mirrored or replayed"
+    );
+}
+
+#[test]
+fn separate_native_mcp_threads_exchange_replies_without_sender_arguments() {
+    use serde_json::{json, Value};
+    let home = tempfile::tempdir().unwrap();
+    let one = seed_codex(home.path(), "one");
+    let two = seed_codex(home.path(), "two");
+    let mut first = McpProcess::from_command(isolated(home.path(), Some(&one)));
+    let mut second = McpProcess::from_command(isolated(home.path(), Some(&two)));
+    let listed: Value = serde_json::from_str(&first.tool("list_agents", json!({}))).unwrap();
+    assert_eq!(listed["you"], one);
+    assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["agents"][0]["address"], two);
+    second.tool("check_inbox", json!({}));
+    let sent = first.tool(
+        "send_message",
+        json!({"to":two,"body":"request","kind":"request"}),
+    );
+    assert!(sent.contains("selected polling automatically"));
+    assert!(sent.contains("every 2 seconds"));
+    // Use CLI in the receiving thread; same native identity and journal as MCP.
+    let received: Value =
+        serde_json::from_str(&success(home.path(), Some(&two), &["inbox", "--json"])).unwrap();
+    let id = received[0]["id"].as_str().unwrap();
+    let sent = second.tool(
+        "send_message",
+        json!({"to":one,"body":"reply","kind":"reply","reply_to":id}),
+    );
+    assert!(sent.contains("selected polling automatically"));
+    assert!(!sent.contains("every 2 seconds"));
+    assert!(first.tool("check_inbox", json!({})).contains(id));
+    let schema = first.request("tools/list", json!({}));
+    let tools = schema["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 3);
+    for tool in tools {
+        let props = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert!(!props.contains_key("address"));
+        assert!(!props.contains_key("from"));
+    }
+}
+
+#[test]
+fn codex_metadata_keeps_a_shared_mcp_process_bound_to_each_call() {
+    use serde_json::{json, Value};
+    let home = tempfile::tempdir().unwrap();
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    let one = seed_codex(home.path(), &first);
+    let two = seed_codex(home.path(), &second);
+    let mut command = isolated(home.path(), None);
+    command.env("CODEX_THREAD_ID", uuid::Uuid::new_v4().to_string());
+    let mut mcp = McpProcess::from_command(command);
+    for (id, address) in [(&first, &one), (&second, &two), (&first, &one)] {
+        let response = mcp.request(
+            "tools/call",
+            json!({"name":"list_agents","arguments":{},"_meta":{"threadId":id}}),
+        );
+        assert_ne!(response["isError"], true, "{response}");
+        let listed: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(listed["you"], *address);
+        assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+    }
+    let response = mcp.request("tools/call", json!({"name":"list_agents","arguments":{}}));
+    assert_eq!(
+        response["isError"], true,
+        "missing metadata cannot adopt the inherited outer thread"
+    );
+    let response = mcp.request(
+        "tools/call",
+        json!({"name":"check_inbox","arguments":{},"_meta":{"threadId":"bad;id"}}),
+    );
+    assert_eq!(response["isError"], true);
+}
+
+#[test]
+fn verified_claude_ancestor_wins_over_inherited_codex_and_stale_pid_variables() {
+    let home = tempfile::tempdir().unwrap();
+    let (_listener, claude) = native_fixture(home.path());
+    let mut command = isolated(home.path(), None);
+    command
+        .env("CODEX_THREAD_ID", uuid::Uuid::new_v4().to_string())
+        .env("CLAUDE_PID", "123");
+    let out = command.arg("whoami").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("address: {claude}")));
+    let mut command = isolated(home.path(), None);
+    command.env("CODEX_THREAD_ID", uuid::Uuid::new_v4().to_string());
+    let mut mcp = McpProcess::from_command(command);
+    let listed: serde_json::Value =
+        serde_json::from_str(&mcp.tool("list_agents", serde_json::json!({}))).unwrap();
+    assert_eq!(listed["you"], claude);
 }
