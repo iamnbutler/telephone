@@ -6,7 +6,7 @@ description = "CLI and MCP server for messaging between local coding agents"
 license = "MIT"
 repository = "https://github.com/iamnbutler/telephone"
 readme = "README.md"
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "docs/opencode-native.md", "docs/codex-polling.md", "LICENSE"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "SECURITY.md", "docs/opencode-native.md", "docs/codex-polling.md", "docs/context-management.md", "LICENSE"]
 
 [dependencies]
 anyhow = "1"

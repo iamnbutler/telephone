@@ -20,7 +20,9 @@
 
 mod adapters;
 mod address;
+mod context;
 mod discovery;
+mod doctor;
 mod envelope;
 mod guidance;
 mod identity;
@@ -158,6 +160,9 @@ enum Command {
         /// Message id this is a reply to
         #[arg(long)]
         reply_to: Option<String>,
+        /// Use inbox for a polling recipient; auto uses the configured native/fallback route
+        #[arg(long, value_enum, default_value = "auto")]
+        delivery: send::Delivery,
     },
 
     /// Read messages sent to you
@@ -177,10 +182,19 @@ enum Command {
     Mcp,
 
     /// Report discovered agents, configured routes and liveness evidence
-    Doctor,
+    Doctor {
+        /// Inspect this exact recipient's route and recent delivery history
+        address: Option<address::Address>,
+        /// Emit per-recipient diagnostics as JSON
+        #[arg(long, requires = "address")]
+        json: bool,
+    },
 
     /// Print the configuration needed to wire telephone into each runtime
     Install,
+
+    /// Claude Code hook: remind at 250k/300k context tokens (JSON on stdin)
+    ContextHook,
 }
 
 fn main() -> std::process::ExitCode {
@@ -282,10 +296,11 @@ fn run() -> Result<()> {
             body,
             kind,
             reply_to,
+            delivery,
         } => {
             let kind = Kind::parse(&kind)
                 .ok_or_else(|| anyhow::anyhow!("kind must be inform, request, reply or event"))?;
-            let report = send::send(&to, &body, kind, reply_to)?;
+            let report = send::send(&to, &body, kind, reply_to, delivery)?;
             let mut stdout = std::io::stdout().lock();
             writeln!(stdout, "{report}").context(
                 "writing send report; delivery may already have occurred, do not retry blindly",
@@ -298,8 +313,19 @@ fn run() -> Result<()> {
         Command::Inbox { peek, json } => cmd_inbox(peek, json),
         Command::Whoami => cmd_whoami(),
         Command::Mcp => mcp::serve(),
-        Command::Doctor => cmd_doctor(),
+        Command::Doctor {
+            address: Some(address),
+            json,
+        } => doctor::recipient(&address, json),
+        Command::Doctor { address: None, .. } => cmd_doctor(),
         Command::Install => cmd_install(),
+        Command::ContextHook => {
+            // Advisory hooks must never block a tool or turn on a read/state error.
+            if let Err(e) = context::run() {
+                debug(|| format!("context reminder skipped: {e:#}"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -388,6 +414,12 @@ fn cmd_list(json: bool, all: bool) -> Result<()> {
     if inferred {
         println!("recent? = was active recently, but nothing could confirm it is still running");
     }
+    if agents
+        .iter()
+        .any(|a| matches!(a.transports.first(), Some(registry::Transport::CodexQueue)))
+    {
+        println!("queue = native Codex queue, separate from telephone inbox; use --delivery inbox for polling peers");
+    }
     for w in warnings {
         warn(w);
     }
@@ -407,7 +439,16 @@ fn cmd_inbox(peek: bool, json: bool) -> Result<()> {
     for warning in &batch.warnings {
         warn(warning);
     }
-    let rendered = if json {
+    // Preserve the JSON array on stdout. Failed notice output rolls back its
+    // receipt, just like failed message output, so a later poll can see it.
+    if json && !batch.notices.is_empty() {
+        let mut stderr = std::io::stderr().lock();
+        for notice in &batch.notices {
+            writeln!(stderr, "notice: {}", serde_json::json!(notice))?;
+        }
+        stderr.flush()?;
+    }
+    let mut rendered = if json {
         serde_json::to_string_pretty(&batch.messages)?
     } else if batch.messages.is_empty() {
         "No new messages.".into()
@@ -419,6 +460,12 @@ fn cmd_inbox(peek: bool, json: bool) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n\n")
     };
+    if !json {
+        for notice in &batch.notices {
+            rendered.push('\n');
+            rendered.push_str(notice);
+        }
+    }
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{rendered}").context("writing inbox; messages remain unread on failure")?;
     stdout
@@ -526,6 +573,9 @@ fn cmd_doctor() -> Result<()> {
         let batch = inbox::read(addr, true)?;
         let waiting = batch.messages.len();
         println!("\ninbox:      {waiting} message(s) waiting");
+        for notice in &batch.notices {
+            println!("{notice}");
+        }
         batch.acknowledge()?;
     }
     Ok(())
@@ -546,6 +596,19 @@ fn cmd_install() -> Result<()> {
     println!(
         "  claude mcp add telephone -s user -- {} mcp\n",
         address::shell_quote(&exe)
+    );
+    println!("Optional context reminders -- merge into Claude Code settings.json hooks:\n");
+    println!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::json!({"hooks":{"PostToolUse":[{
+            "hooks":[{"type":"command","command":format!("{} context-hook",address::shell_quote(&exe)),"timeout":5}]
+        }]}}))?
+    );
+    println!(
+        "Reminds once at 250k and 300k tokens; resets below 250k or after recorded compaction."
+    );
+    println!(
+        "For unattended Claude sessions, use /autocompact 300k with auto-compaction enabled.\n"
     );
     println!("Codex -- add this to ~/.codex/config.toml:\n");
     println!("  [mcp_servers.telephone]");

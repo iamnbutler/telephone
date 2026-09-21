@@ -6,8 +6,8 @@ use crate::{
 use serde::Serialize;
 use uuid::Uuid;
 
-const DELIVERY: &str = "Incoming messages may require polling. Unless this address has an explicitly configured native route, Telephone will not wake this thread, even when your outgoing message used native delivery. A native route can also fall back to this inbox.";
-const WAITING: &str = "When a user-authorized exchange expects a reply, poll your own inbox before ending the exchange; do not wait for the user to remind you. Check every 2 seconds for up to 30 seconds, or use the user's deadline. Stop when the expected reply arrives; otherwise report it pending. An empty poll is not a delivery failure. Do not resend because the inbox is empty or acknowledge acknowledgments.";
+const DELIVERY: &str = "Without a configured native return route, Telephone will not wake this thread. Outgoing native delivery does not change this; native replies can also fall back to your inbox.";
+const WAITING: &str = "If a user-authorized exchange expects a reply, poll your own inbox every 2 seconds for up to 30 seconds (or the user's deadline). Stop on the expected reply; otherwise report it pending. Do not resend because the inbox is empty or acknowledge acknowledgments.";
 
 #[derive(Serialize)]
 struct InboxArguments<'a> {

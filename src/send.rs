@@ -6,12 +6,35 @@ use crate::{
     store::Store,
 };
 use anyhow::{Context, Result};
+use serde::Deserialize;
 
-pub fn send(to: &str, body: &str, kind: Kind, reply_to: Option<String>) -> Result<String> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    #[default]
+    Auto,
+    Inbox,
+}
+
+pub fn send(
+    to: &str,
+    body: &str,
+    kind: Kind,
+    reply_to: Option<String>,
+    delivery: Delivery,
+) -> Result<String> {
     let reply_to = reply_to
         .map(|id| uuid::Uuid::parse_str(&id).context("reply_to must be a UUID"))
         .transpose()?;
-    send_from(&crate::inbox::root()?, None, to, body, kind, reply_to)
+    send_from(
+        &crate::inbox::root()?,
+        None,
+        to,
+        body,
+        kind,
+        reply_to,
+        delivery,
+    )
 }
 
 pub fn send_from(
@@ -21,6 +44,7 @@ pub fn send_from(
     body: &str,
     kind: Kind,
     reply_to: Option<uuid::Uuid>,
+    delivery: Delivery,
 ) -> Result<String> {
     if kind == Kind::Reply && reply_to.is_none() {
         anyhow::bail!("a reply requires --reply-to");
@@ -57,7 +81,22 @@ pub fn send_from(
     } else {
         String::new()
     };
-    let outcome = match adapter.deliver(&target, &env) {
+    let delivered = if delivery == Delivery::Inbox {
+        // Choose once, before any native send/probe. Keep registered-recipient
+        // lease validation atomic with the deposit, just like its adapter.
+        let deposited = if env.to.inbox_runtime().is_some() {
+            store.deposit_registered(&env.to, &env, crate::envelope::now_millis())
+        } else {
+            store.deposit(&env.to, &env)
+        };
+        deposited.map(|()| Delivered::Queued {
+            path: store.path.clone(),
+            note: "Inbox delivery requested; no native wake-up attempted. The recipient must use check_inbox or telephone inbox.".into(),
+        })
+    } else {
+        adapter.deliver(&target, &env)
+    };
+    let outcome = match delivered {
         Ok(outcome) => outcome,
         Err(e) => {
             if let Err(journal) = store.outcome(env.id, "failed-or-uncertain") {
@@ -73,12 +112,16 @@ pub fn send_from(
         Delivered::Unconfirmed { via } => (
             "unconfirmed",
             format!(
-                "Written over {via}; acceptance and reading are unconfirmed. Do not retry blindly."
+                "Written over {via}; acceptance and reading are unconfirmed. Native delivery does not populate telephone inbox/check_inbox. Do not retry blindly."
             ),
+        ),
+        Delivered::Accepted { via: "codex queue" } => (
+            "accepted",
+            "Accepted by codex queue; not a read receipt. This bypasses telephone inbox/check_inbox and may wait until the recipient's active turn ends. For future messages to a polling peer, use --delivery inbox (MCP: delivery=\"inbox\"). Do not resend this accepted message blindly.".into(),
         ),
         Delivered::Accepted { via } => (
             "accepted",
-            format!("Accepted by {via}; not a read receipt."),
+            format!("Accepted by {via}; not a read receipt. Native delivery does not populate telephone inbox/check_inbox."),
         ),
         Delivered::Queued { path, note } => (
             "queued",

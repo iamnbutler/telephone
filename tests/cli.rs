@@ -74,8 +74,39 @@ fn codex_polling_is_explicit_and_bypasses_native_queue_without_replaying_it() {
         String::from_utf8_lossy(&native.stderr)
     );
     assert!(String::from_utf8_lossy(&native.stdout).contains("Accepted by codex queue"));
+    assert!(
+        String::from_utf8_lossy(&native.stdout).contains("bypasses telephone inbox/check_inbox")
+    );
+    assert!(String::from_utf8_lossy(&native.stdout)
+        .contains("Do not resend this accepted message blindly"));
     let native_log = fs::read(&log).unwrap();
     assert!(!native_log.is_empty());
+
+    // The historical native send is visible to the recipient, without pretending
+    // that we know whether Codex has already read it. JSON stdout stays an array.
+    let empty = isolated(home.path(), Some(&recipient))
+        .args(["inbox", "--json"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&empty.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    let notice = String::from_utf8_lossy(&empty.stderr);
+    assert!(notice.contains("Native queue history: 1 of the last 1"));
+    assert!(notice.contains("Native read status is unknown"));
+    let quiet = isolated(home.path(), Some(&recipient))
+        .args(["inbox", "--json"])
+        .output()
+        .unwrap();
+    assert!(quiet.status.success());
+    assert!(
+        quiet.stderr.is_empty(),
+        "ordinary polls must not repeat unchanged history"
+    );
+    let peek = success(home.path(), Some(&recipient), &["inbox", "--peek"]);
+    assert!(peek.contains("No new messages.\nNative queue history:"));
 
     let polling = isolated(home.path(), Some(sender))
         .env("CODEX_CLI_PATH", &fake_cli)
@@ -96,18 +127,131 @@ fn codex_polling_is_explicit_and_bypasses_native_queue_without_replaying_it() {
         "polling must not probe or send through the native CLI"
     );
 
+    let explicit = isolated(home.path(), Some(sender))
+        .env("CODEX_CLI_PATH", &fake_cli)
+        .env("QUEUE_LOG", &log)
+        .args([
+            "send",
+            &recipient,
+            "per-call polling message",
+            "--delivery",
+            "inbox",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    assert!(String::from_utf8_lossy(&explicit.stdout).contains("no native wake-up attempted"));
+    assert_eq!(fs::read(&log).unwrap(), native_log);
+
     let inbox: serde_json::Value = serde_json::from_str(&success(
         home.path(),
         Some(&recipient),
         &["inbox", "--json"],
     ))
     .unwrap();
-    assert_eq!(inbox.as_array().unwrap().len(), 1);
+    assert_eq!(inbox.as_array().unwrap().len(), 2);
     assert_eq!(inbox[0]["body"], "polling message");
+    assert_eq!(inbox[1]["body"], "per-call polling message");
     assert_eq!(
         success(home.path(), Some(&recipient), &["inbox", "--json"]).trim(),
         "[]"
     );
+
+    // A shared MCP process can choose a different route per call. Its own native
+    // identity reads the recipient inbox; the registered sender uses `from`.
+    let mut command = isolated(home.path(), Some(&recipient));
+    command
+        .env("CODEX_CLI_PATH", &fake_cli)
+        .env("QUEUE_LOG", &log);
+    let mut mcp = McpProcess::from_command(command);
+    let native = mcp.tool(
+        "send_message",
+        serde_json::json!({
+            "from":sender,"to":recipient,"body":"MCP native message"
+        }),
+    );
+    assert!(native.contains("bypasses telephone inbox/check_inbox"));
+    let history: serde_json::Value =
+        serde_json::from_str(&mcp.tool("check_inbox", serde_json::json!({}))).unwrap();
+    assert_eq!(history["messages"], serde_json::json!([]));
+    assert_eq!(history["notices"].as_array().unwrap().len(), 1);
+    assert!(history["notices"][0]
+        .as_str()
+        .unwrap()
+        .contains("2 of the last 4"));
+    let quiet: serde_json::Value =
+        serde_json::from_str(&mcp.tool("check_inbox", serde_json::json!({}))).unwrap();
+    assert_eq!(quiet["notices"], serde_json::json!([]));
+    let before_inbox = fs::read(&log).unwrap();
+    let sent = mcp.tool(
+        "send_message",
+        serde_json::json!({
+            "from":sender,"to":recipient,"body":"MCP polling message","delivery":"inbox"
+        }),
+    );
+    assert!(sent.contains("no native wake-up attempted"));
+    assert_eq!(fs::read(&log).unwrap(), before_inbox);
+    let delivered: serde_json::Value =
+        serde_json::from_str(&mcp.tool("check_inbox", serde_json::json!({}))).unwrap();
+    assert_eq!(delivered["messages"].as_array().unwrap().len(), 1);
+    assert!(delivered["messages"][0]
+        .as_str()
+        .unwrap()
+        .contains("MCP polling message"));
+    drop(mcp);
+
+    let doctor = isolated(home.path(), None)
+        .env("CODEX_CLI_PATH", &fake_cli)
+        .env("QUEUE_LOG", &log)
+        .args(["doctor", &recipient, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["preferred_transport"], "queue");
+    assert_eq!(doctor["liveness"], "recent?");
+    let history = doctor["recent_deliveries"].as_array().unwrap();
+    assert_eq!(history.len(), 5);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|entry| entry["channel"] == "codex native queue")
+            .count(),
+        2
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|entry| entry["inbox_read"] == true)
+            .count(),
+        3
+    );
+    assert!(history.iter().all(|entry| entry.get("body").is_none()));
+    assert_eq!(
+        fs::read(&log).unwrap(),
+        before_inbox,
+        "doctor must not probe or deliver"
+    );
+
+    // History remains inspectable after the recipient disappears from discovery.
+    let conn = rusqlite::Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+    conn.execute("DELETE FROM threads", []).unwrap();
+    let gone: serde_json::Value = serde_json::from_str(&success(
+        home.path(),
+        None,
+        &["doctor", &recipient, "--json"],
+    ))
+    .unwrap();
+    assert!(gone["preferred_transport"].is_null());
+    assert_eq!(gone["recent_deliveries"].as_array().unwrap().len(), 5);
 }
 
 fn assert_polling_text(text: &str, address: &str) {
@@ -264,6 +408,9 @@ struct McpProcess {
 }
 impl McpProcess {
     fn start(home: &std::path::Path) -> Self {
+        Self::from_command(isolated(home, None))
+    }
+    fn from_command(mut command: Command) -> Self {
         use std::{os::fd::OwnedFd, os::unix::net::UnixStream, time::Duration};
         let (client, server) = UnixStream::pair().unwrap();
         client
@@ -272,7 +419,7 @@ impl McpProcess {
         client
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let child = isolated(home, None)
+        let child = command
             .arg("mcp")
             .stdin(Stdio::from(OwnedFd::from(server.try_clone().unwrap())))
             .stdout(Stdio::from(OwnedFd::from(server)))

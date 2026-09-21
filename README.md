@@ -41,12 +41,15 @@ Native delivery depends on runtime internals. If unavailable before sending,
 messages go to an inbox the receiving agent must check. A socket write is not
 a receipt; Telephone reports uncertainty and does not retry it automatically.
 
-For an active Codex team that polls `telephone inbox`, send with
-`TELEPHONE_CODEX_INBOX=1 telephone send <address> <message>` (or export that
-variable for the session). This chooses the inbox before any native attempt;
-it does not wake an idle thread. The default still uses the native queue when
-available. Native-queued messages are not also copied into the polling inbox.
-See [Codex polling](docs/codex-polling.md).
+For a peer that polls `telephone inbox`, send with
+`telephone send <address> <message> --delivery inbox` (MCP: `delivery: "inbox"`).
+This chooses the inbox before any native attempt; it does not wake an idle
+thread. The default uses native delivery when available. Native-queued messages
+are not also copied into the polling inbox. Empty Codex inboxes report relevant
+native-queue history once per newly observed acceptance; this is not a read or
+pending receipt. Inspect a recipient with `telephone doctor <address>` (or
+`--json`). See [Codex polling](docs/codex-polling.md), including the existing
+`TELEPHONE_CODEX_INBOX=1` environment option.
 
 To reply, use `--kind reply --reply-to <message-id>`. Replies must match a
 message in the local journal; exchanges stop after eight hops.
@@ -57,6 +60,11 @@ quiet threads. Listings are capped; exact addresses use a separate lookup.
 If discovery is incomplete, Telephone reports it and refuses short-name routing.
 
 See `telephone --help` and [security and upgrade notes](SECURITY.md).
+
+For long-running exchanges, the optional Claude Code `telephone context-hook`
+reminds at 250k and 300k context tokens, once per threshold until context drops.
+See [context management](docs/context-management.md) for hook setup and native
+auto-compaction for unattended sessions.
 
 ## OpenCode, Zed, Delta and other harnesses
 

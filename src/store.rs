@@ -16,6 +16,8 @@ use uuid::Uuid;
 const BATCH_SIZE: usize = 100;
 const MAX_PENDING: i64 = 1000;
 
+pub mod context;
+pub mod diagnostics;
 pub mod opencode;
 pub mod registrations;
 
@@ -28,6 +30,7 @@ pub struct InboxBatch {
     conn: Connection,
     pub messages: Vec<Envelope>,
     pub warnings: Vec<String>,
+    pub notices: Vec<String>,
 }
 impl InboxBatch {
     /// Call only after the response was successfully flushed. Dropping the
@@ -67,6 +70,8 @@ impl Store {
             .context("setting journal lock deadline")?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, envelope TEXT NOT NULL, outcome TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS messages_recipient ON messages (
+                CASE WHEN json_valid(envelope) THEN json_extract(envelope,'$.to') END);
             CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY REFERENCES messages(id), recipient TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS inbox_recipient ON inbox(recipient, read);
             CREATE TABLE IF NOT EXISTS registrations (
@@ -75,7 +80,11 @@ impl Store {
             CREATE INDEX IF NOT EXISTS registrations_runtime ON registrations(runtime, expires_at);
             CREATE TABLE IF NOT EXISTS opencode_routes (
                 address TEXT PRIMARY KEY REFERENCES registrations(address) ON DELETE CASCADE,
-                route TEXT NOT NULL);")
+                route TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS context_reminders (
+                session TEXT PRIMARY KEY, level INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS native_queue_notices (
+                recipient TEXT PRIMARY KEY, last_id TEXT NOT NULL);")
             .context("initializing message journal")?;
         private_fs::check_sidecars(&path)?;
         Ok(Self { conn, root, path })
@@ -143,7 +152,7 @@ impl Store {
     }
 
     pub fn inbox(mut self, addr: &Address, peek: bool) -> Result<InboxBatch> {
-        let warnings = self.import_legacy(addr)?;
+        let mut warnings = self.import_legacy(addr)?;
         // Connection-owned transaction: every early return/serialization/output
         // failure closes this connection and rolls back the read flags.
         self.conn
@@ -175,10 +184,22 @@ impl Store {
                 }
             }
         }
+        let notices = if messages.is_empty() {
+            match self.native_queue_notice(addr, peek) {
+                Ok(notice) => notice.into_iter().collect(),
+                Err(error) => {
+                    warnings.push(format!("Native queue history unavailable: {error:#}"));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         Ok(InboxBatch {
             conn: self.conn,
             messages,
             warnings,
+            notices,
         })
     }
 
