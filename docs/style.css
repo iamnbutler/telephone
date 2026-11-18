@@ -88,10 +88,14 @@ footer { margin-top: 25px; padding: 10px 0; border-top: 1px solid var(--rule); f
 .plasma {
   position: fixed;
   right: 0;
-  top: 50%;
-  transform: translateY(-50%);
+  /* Centre vertically without a transform: Firefox draws background-clip:text
+     glyphs at the untransformed position, so translateY(-50%) left the art
+     shifted down, clipped, and showing the wrong part of the gradient. */
+  top: 0;
+  bottom: 0;
+  height: fit-content;
   z-index: -1;
-  margin: 0;
+  margin: auto 0;
   padding: 0;
   border: 0;
   background: none;
